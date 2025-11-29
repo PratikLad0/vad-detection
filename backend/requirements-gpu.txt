@@ -6,7 +6,10 @@
 #   pip uninstall torch torchvision torchaudio
 #
 # Step 2: Install CUDA-enabled PyTorch (choose one based on your CUDA version)
-#   For CUDA 12.4 (latest, recommended):
+#   For CUDA 13.0 (latest, requires driver 580+):
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+#     Note: If cu130 not available, use cu121 (backward compatible with CUDA 13.0)
+#   For CUDA 12.4:
 #     Note: Use cu121 wheels (backward compatible with CUDA 12.4)
 #     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 #   For CUDA 12.1:

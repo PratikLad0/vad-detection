@@ -6,6 +6,7 @@ Chatbot Service with multiple LLM backends:
 """
 
 import os
+import sys
 import logging
 from typing import Optional, Dict, List
 from pathlib import Path
@@ -50,7 +51,26 @@ if llama_model_path_raw:
     model_path = Path(llama_model_path_raw)
     if not model_path.is_absolute():
         # Resolve relative to backend directory
-        LLAMA_MODEL_PATH = str((BACKEND_DIR / model_path).resolve())
+        resolved_path = (BACKEND_DIR / model_path).resolve()
+        # Check if resolved path exists, if not try alternative (models vs model)
+        if not resolved_path.exists():
+            # Try with singular 'model' if 'models' was specified
+            if "models" in str(model_path):
+                alt_path = Path(str(model_path).replace("models", "model"))
+                alt_resolved = (BACKEND_DIR / alt_path).resolve()
+                if alt_resolved.exists():
+                    resolved_path = alt_resolved
+                    # Use logging directly since logger may not be initialized yet
+                    logging.info(f"Found model in 'model' directory instead of 'models': {resolved_path}")
+            # Try with plural 'models' if 'model' was specified
+            elif "model/" in str(model_path) or "model\\" in str(model_path):
+                alt_path = Path(str(model_path).replace("model/", "models/").replace("model\\", "models\\"))
+                alt_resolved = (BACKEND_DIR / alt_path).resolve()
+                if alt_resolved.exists():
+                    resolved_path = alt_resolved
+                    # Use logging directly since logger may not be initialized yet
+                    logging.info(f"Found model in 'models' directory instead of 'model': {resolved_path}")
+        LLAMA_MODEL_PATH = str(resolved_path)
     else:
         LLAMA_MODEL_PATH = str(model_path.resolve())
 else:
@@ -186,20 +206,49 @@ def get_llama_model() -> Optional[Llama]:
         logger.warning("LLAMA_MODEL_PATH is not set in .env file")
         return None
     
-    # Check if model file exists
-    if not os.path.exists(LLAMA_MODEL_PATH):
-        logger.error(f"llama.cpp model file not found: {LLAMA_MODEL_PATH}")
+    # Use local variable to avoid modifying global
+    model_path = LLAMA_MODEL_PATH
+    
+    # Check if model file exists (try multiple methods for robustness)
+    model_exists = os.path.exists(model_path) or Path(model_path).exists()
+    
+    # Also try case-insensitive check on Windows
+    if not model_exists and sys.platform == "win32":
+        try:
+            # Try case-insensitive search
+            model_dir = Path(model_path).parent
+            model_name = Path(model_path).name
+            if model_dir.exists():
+                for file in model_dir.iterdir():
+                    if file.name.lower() == model_name.lower():
+                        model_path = str(file.resolve())
+                        model_exists = True
+                        logger.info(f"Found model file (case-insensitive match): {model_path}")
+                        break
+        except Exception:
+            pass
+    
+    if not model_exists:
+        logger.error(f"llama.cpp model file not found: {model_path}")
         logger.error(f"Please check your .env file and ensure LLAMA_MODEL_PATH points to a valid .gguf file")
         logger.error(f"Current backend directory: {BACKEND_DIR}")
-        logger.error(f"Expected model path: {LLAMA_MODEL_PATH}")
+        logger.error(f"Expected model path: {model_path}")
+        # List available .gguf files in models directory for debugging
+        models_dir = BACKEND_DIR / "models"
+        if models_dir.exists():
+            gguf_files = list(models_dir.glob("*.gguf"))
+            if gguf_files:
+                logger.error(f"Available .gguf files in models directory:")
+                for f in gguf_files:
+                    logger.error(f"  - {f.name}")
         return None
     
     if _llama_model is None:
         try:
-            logger.info(f"Loading llama.cpp model from: {LLAMA_MODEL_PATH}")
-            logger.info(f"Model file size: {os.path.getsize(LLAMA_MODEL_PATH) / (1024*1024):.2f} MB")
+            logger.info(f"Loading llama.cpp model from: {model_path}")
+            logger.info(f"Model file size: {os.path.getsize(model_path) / (1024*1024):.2f} MB")
             _llama_model = Llama(
-                model_path=LLAMA_MODEL_PATH,
+                model_path=model_path,
                 n_ctx=LLAMA_N_CTX,
                 n_threads=LLAMA_N_THREADS,
                 verbose=False
@@ -207,7 +256,7 @@ def get_llama_model() -> Optional[Llama]:
             logger.info("llama.cpp model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load llama.cpp model: {str(e)}")
-            logger.error(f"Model path attempted: {LLAMA_MODEL_PATH}")
+            logger.error(f"Model path attempted: {model_path}")
             return None
     return _llama_model
 
@@ -225,21 +274,20 @@ def get_hf_model():
     
     if _hf_model is None and HF_MODEL_NAME:
         try:
-            logger.info(f"Loading Hugging Face model: {HF_MODEL_NAME}")
+            logger.info(f"Loading Hugging Face model: {HF_MODEL_NAME} on {HF_DEVICE}")
             _hf_tokenizer = _AutoTokenizer.from_pretrained(HF_MODEL_NAME)
             _hf_model = _AutoModelForCausalLM.from_pretrained(HF_MODEL_NAME)
             _hf_model.to(HF_DEVICE)
             _hf_model.eval()
             logger.info("Hugging Face model loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load Hugging Face model: {str(e)}")
+            logger.error(f"Failed to load Hugging Face model: {str(e)}", exc_info=True)
             return None, None
     return _hf_model, _hf_tokenizer
 
 
 def generate_response_llama(prompt: str, max_tokens: int = 150) -> Optional[str]:
     """Generate response using llama.cpp - optimized for speed"""
-    logger.info(f"llama.cpp: Processing transcription: '{prompt[:100]}{'...' if len(prompt) > 100 else ''}'")
     model = get_llama_model()
     if not model:
         return None
@@ -270,7 +318,6 @@ def generate_response_llama(prompt: str, max_tokens: int = 150) -> Optional[str]
 
 def generate_response_openai(prompt: str, max_tokens: int = 150) -> Optional[str]:
     """Generate response using OpenAI"""
-    logger.info(f"OpenAI: Processing transcription: '{prompt[:100]}{'...' if len(prompt) > 100 else ''}'")
     if not OPENAI_VALID_KEY:
         return None
     
@@ -294,8 +341,8 @@ def generate_response_openai(prompt: str, max_tokens: int = 150) -> Optional[str
 
 def generate_response_huggingface(prompt: str, max_length: int = 150) -> Optional[str]:
     """Generate response using Hugging Face - optimized for speed"""
-    logger.info(f"Hugging Face: Processing transcription: '{prompt[:100]}{'...' if len(prompt) > 100 else ''}'")
     if not HF_AVAILABLE or _torch is None:
+        logger.warning("⚠️ Hugging Face not available or PyTorch not loaded")
         return None
     
     model, tokenizer = get_hf_model()
@@ -398,7 +445,7 @@ def initialize_chatbot_backends() -> Dict[str, bool]:
             else:
                 logger.warning("✗ Hugging Face backend failed to initialize")
         except Exception as e:
-            logger.error(f"✗ Hugging Face backend error: {str(e)}")
+            logger.error(f"✗ Hugging Face backend error: {str(e)}", exc_info=True)
     else:
         logger.info("ℹ Hugging Face not configured (HF_MODEL_NAME not set in .env)")
     
@@ -440,8 +487,6 @@ def generate_chatbot_response(user_message: str) -> Dict[str, any]:
             "error": str or None
         }
     """
-    logger.info(f"Generating chatbot response for transcription: '{user_message[:100]}{'...' if len(user_message) > 100 else ''}'")
-    
     # Check guardrails first
     is_safe, error_msg = check_content_guardrails(user_message)
     if not is_safe:
@@ -490,15 +535,20 @@ def generate_chatbot_response(user_message: str) -> Dict[str, any]:
     for backend in backends_to_try:
         response = None
         
-        if backend == "llama":
-            response = generate_response_llama(user_message)
-        elif backend == "openai":
-            response = generate_response_openai(user_message)
-        elif backend == "huggingface" and HF_CONFIGURED:
-            response = generate_response_huggingface(user_message)
+        try:
+            if backend == "llama":
+                response = generate_response_llama(user_message)
+            elif backend == "openai":
+                response = generate_response_openai(user_message)
+            elif backend == "huggingface" and HF_CONFIGURED:
+                response = generate_response_huggingface(user_message)
+            else:
+                continue
+        except Exception as e:
+            logger.error(f"Backend '{backend}' error: {str(e)}", exc_info=True)
+            continue
         
         if response:
-            logger.info(f"Chatbot response generated using {backend}")
             return {
                 "response": response,
                 "backend_used": backend,

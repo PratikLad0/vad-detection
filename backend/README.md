@@ -9,31 +9,18 @@ FastAPI backend for the VAD-based audio recorder. Handles file uploads, storage,
 - **FFmpeg** (required for Whisper audio processing)
 - **RAM**: Minimum 4GB, 8GB+ recommended (for Hugging Face models)
 - **Storage**: 5-10GB free space (for models and dependencies)
-- **GPU** (optional): NVIDIA GPU with CUDA for faster Hugging Face inference
-
-### Installing FFmpeg
-
-**Windows:**
-1. Download FFmpeg from: https://www.gyan.dev/ffmpeg/builds/
-2. Extract the zip file to a location (e.g., `C:\ffmpeg`)
-3. Add FFmpeg to your system PATH:
-   - Open System Properties → Environment Variables
-   - Edit the "Path" variable
-   - Add the path to the `bin` folder (e.g., `C:\ffmpeg\bin`)
-4. Verify installation: Open PowerShell/CMD and run `ffmpeg -version`
-
-**Linux:**
-```bash
-sudo apt-get update
-sudo apt-get install ffmpeg
-```
-
-**macOS:**
-```bash
-brew install ffmpeg
-```
+- **GPU** (optional): NVIDIA GPU with CUDA for faster processing
 
 ## Installation
+
+### Quick Start
+
+Choose your setup based on your hardware:
+
+- **CPU Setup** (No GPU): See [CPU_SETUP.md](CPU_SETUP.md) for complete instructions
+- **GPU Setup** (NVIDIA GPU): See [GPU_SETUP.md](GPU_SETUP.md) for complete CUDA installation
+
+### Basic Installation Steps
 
 1. **Create Virtual Environment**:
 
@@ -54,13 +41,28 @@ source .venv/bin/activate
 2. **Install Dependencies**:
 
 ```bash
+# For CPU-only setup (default)
 pip install -r requirements.txt
+
+# For GPU setup, follow GPU_SETUP.md first to install CUDA-enabled PyTorch,
+# then install remaining dependencies with requirements.txt
 ```
 
-**Note on Hugging Face:**
-- Models download automatically on first use (350MB-1.5GB depending on model)
-- For CPU usage: No additional setup needed
-- For GPU usage: Install CUDA toolkit and ensure GPU drivers are compatible
+### Detailed Setup Guides
+
+- **[CPU_SETUP.md](CPU_SETUP.md)**: Complete guide for CPU-only installation
+  - FFmpeg installation
+  - CPU-optimized model recommendations
+  - Performance tuning tips
+
+- **[GPU_SETUP.md](GPU_SETUP.md)**: Complete guide for GPU acceleration
+  - CUDA Toolkit installation
+  - PyTorch with CUDA setup
+  - GPU model recommendations
+  - Troubleshooting GPU issues
+
+- **[HUGGINGFACE_SETUP.md](HUGGINGFACE_SETUP.md)**: HuggingFace model configuration
+- **[PERFORMANCE_OPTIMIZATIONS.md](PERFORMANCE_OPTIMIZATIONS.md)**: Performance tuning guide
 
 ## Development
 

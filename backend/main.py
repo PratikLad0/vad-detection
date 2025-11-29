@@ -382,6 +382,9 @@ async def websocket_audio_stream(websocket: WebSocket):
                                 "type": "error",
                                 "message": f"Failed to decode audio chunk: {str(e)}"
                             })
+                    else:
+                        # Empty chunk - acknowledge but don't add to buffer
+                        await websocket.send_json({"type": "chunk_received"})
                 
                 elif msg_type == "segment_end":
                     # Speech segment ended, transcribe the buffer
@@ -417,8 +420,6 @@ async def websocket_audio_stream(websocket: WebSocket):
                                             "message": error_msg
                                         })
                                     else:
-                                        logger.info(f"Transcribing audio file: {tmp_path} (size: {file_size} bytes)")
-                                        
                                         # Transcribe with ultra-fast settings optimized for speed
                                         result = model.transcribe(
                                             tmp_path, 
@@ -439,11 +440,9 @@ async def websocket_audio_stream(websocket: WebSocket):
                                         # Perform speaker diarization (for logging only, not sent to frontend)
                                         speaker_info = None
                                         try:
-                                            logger.info("Performing speaker diarization...")
                                             diarization_results = diarize_audio(tmp_path, num_speakers=None)
                                             if diarization_results:
                                                 speaker_info = diarization_results[0] if diarization_results else None
-                                                logger.info(f"Speaker diarization: {len(diarization_results)} segments, speaker: {speaker_info.get('speaker_label', 'Unknown') if speaker_info else 'Unknown'}")
                                         except Exception as diarization_error:
                                             logger.warning(f"Speaker diarization failed (non-critical): {str(diarization_error)}")
                                         
@@ -458,19 +457,14 @@ async def websocket_audio_stream(websocket: WebSocket):
                                             
                                             with open(session_log_path, "a", encoding="utf-8") as f:
                                                 f.write(log_entry)
-                                            
-                                            logger.info(f"Transcription saved to log: {transcription[:100]}")
                                         
                                         # Always generate and send chatbot response, even if transcription is empty
-                                        # This ensures the frontend always receives a chatbot_response message
                                         if transcription:
-                                            logger.info(f"Sending transcription to chatbot: {transcription[:100]}...")
                                             try:
                                                 chatbot_result = generate_chatbot_response(transcription)
-                                                logger.info(f"Chatbot received transcription and generated response (backend: {chatbot_result.get('backend_used', 'unknown')})")
                                                 
                                                 if chatbot_result.get("error"):
-                                                    # Guardrails blocked the request
+                                                    logger.warning(f"Chatbot error: {chatbot_result['error']}")
                                                     await websocket.send_json({
                                                         "type": "chatbot_response",
                                                         "response": None,
@@ -479,7 +473,6 @@ async def websocket_audio_stream(websocket: WebSocket):
                                                         "transcription": transcription
                                                     })
                                                 elif chatbot_result.get("response"):
-                                                    # Send chatbot response back to frontend with transcription
                                                     await websocket.send_json({
                                                         "type": "chatbot_response",
                                                         "response": chatbot_result["response"],
@@ -487,17 +480,13 @@ async def websocket_audio_stream(websocket: WebSocket):
                                                         "error": None,
                                                         "transcription": transcription
                                                     })
-                                                    
-                                                    # Log chatbot response
-                                                    logger.info(f"Chatbot response sent (backend: {chatbot_result.get('backend_used')}): {chatbot_result['response'][:100]}")
                                                 else:
-                                                    # Chatbot failed but no error message - send response with error
                                                     logger.warning("Chatbot failed to generate response")
                                                     await websocket.send_json({
                                                         "type": "chatbot_response",
                                                         "response": None,
                                                         "error": chatbot_result.get("error", "Chatbot failed to generate response"),
-                                                        "backend_used": chatbot_result.get("backend_used"),
+                                                        "backend_used": chatbot_result.get("backend_used") or "unknown",
                                                         "transcription": transcription
                                                     })
                                             except Exception as chatbot_error:
@@ -507,7 +496,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                                                     "type": "chatbot_response",
                                                     "response": None,
                                                     "error": f"Chatbot error: {str(chatbot_error)}",
-                                                    "backend_used": None,
+                                                    "backend_used": "error",
                                                     "transcription": transcription
                                                 })
                                         else:
@@ -517,7 +506,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                                                 "type": "chatbot_response",
                                                 "response": None,
                                                 "error": "No speech detected in audio segment",
-                                                "backend_used": None,
+                                                "backend_used": "none",
                                                 "transcription": ""
                                             })
                             
@@ -550,8 +539,16 @@ async def websocket_audio_stream(websocket: WebSocket):
                             
                             # Clear buffer
                             audio_buffer = io.BytesIO()
+                            logger.info(f"🧹 Audio buffer cleared for session {session_id}")
+                    else:
+                        logger.warning(f"⚠️ Audio buffer is empty (tell() <= 0) for session {session_id}, cannot process segment_end")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "No audio data received before segment_end"
+                        })
                     
                     await websocket.send_json({"type": "segment_processed"})
+                    logger.info(f"✅ Sent segment_processed for session {session_id}")
                 
                 elif msg_type == "close":
                     break

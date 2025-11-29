@@ -34,6 +34,13 @@ function App() {
   // VAD sensitivity tuning
   const [vadSensitivity, setVadSensitivity] = useState<number>(0.5) // 0.0 to 1.0
   const vadSensitivityRef = useRef<number>(0.5)
+  
+  // Speech buffer duration settings (in milliseconds)
+  const [silenceDurationMs, setSilenceDurationMs] = useState<number>(1000) // Default 1 second
+  const silenceDurationMsRef = useRef<number>(1000)
+  const [minSpeechDurationMs, setMinSpeechDurationMs] = useState<number>(1000) // Default 1 second
+  const minSpeechDurationMsRef = useRef<number>(1000)
+  
   const [showLogs, setShowLogs] = useState<boolean>(true)
   const [sessionId, setSessionId] = useState<string>('')
   const sessionIdRef = useRef<string>('')
@@ -105,7 +112,7 @@ function App() {
   const audioWebSocketRef = useRef<AudioWebSocket | null>(null)
   const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
   const isTTSPlayingRef = useRef<boolean>(false)
-  const chatMessagesEndRef = useRef<HTMLDivElement | null>(null)
+  const lastTTSStopTimeRef = useRef<number>(0) // Track when TTS was last stopped to prevent false barge-in
   const chatContainerRef = useRef<HTMLDivElement | null>(null)
 
   const addLog = (source: LogSource, message: string, meta?: string) => {
@@ -214,6 +221,15 @@ function App() {
   useEffect(() => {
     vadSensitivityRef.current = vadSensitivity
   }, [vadSensitivity])
+  
+  // Sync speech buffer duration refs with state
+  useEffect(() => {
+    silenceDurationMsRef.current = silenceDurationMs
+  }, [silenceDurationMs])
+  
+  useEffect(() => {
+    minSpeechDurationMsRef.current = minSpeechDurationMs
+  }, [minSpeechDurationMs])
 
   // Generate session ID immediately on component mount (before any other effects)
   // This ensures sessionId is available from the start
@@ -227,14 +243,14 @@ function App() {
     // Set both state and ref immediately
     setSessionId(newSessionId)
     sessionIdRef.current = newSessionId
-    logger.info('Session ID generated on page load', { sessionId: newSessionId })
     console.log('🟢 Session ID generated on page load:', newSessionId)
   }, []) // Empty dependency array - only run once on mount
 
-  // Auto-scroll chat to bottom when new messages arrive (ChatGPT style)
+  // Auto-scroll chat to top when new messages arrive (newest messages at top)
   useEffect(() => {
-    if (chatMessagesEndRef.current) {
-      chatMessagesEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    if (chatContainerRef.current) {
+      // Scroll to top smoothly when new messages arrive
+      chatContainerRef.current.scrollTo({ top: 0, behavior: 'smooth' })
     }
   }, [chatMessages, isProcessing])
 
@@ -300,7 +316,28 @@ function App() {
 
       sessionStartRef.current = performance.now()
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      // Request microphone with echo cancellation and noise suppression
+      // This prevents TTS output from speakers being detected as user speech
+      const audioConstraints: MediaTrackConstraints = {
+        echoCancellation: true,      // Critical: prevents TTS feedback
+        noiseSuppression: true,       // Filters out background noise
+        autoGainControl: true,        // Normalizes audio levels
+        sampleRate: 16000,           // Optimal for speech recognition
+        channelCount: 1               // Mono input
+      }
+      
+      // Add Chrome-specific constraints if available (improves echo cancellation)
+      const chromeConstraints = {
+        googEchoCancellation: true,
+        googNoiseSuppression: true,
+        googAutoGainControl: true,
+        googHighpassFilter: true,
+        googTypingNoiseDetection: true
+      }
+      
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { ...audioConstraints, ...chromeConstraints } as MediaTrackConstraints
+      })
       mediaStreamRef.current = stream
 
       const audioContext = new AudioContext()
@@ -323,44 +360,24 @@ function App() {
       
       // Initialize WebSocket for chatbot responses ONCE (not in the VAD loop)
       if (!audioWebSocketRef.current && sessionIdRef.current) {
-        logger.info('Initializing WebSocket for chatbot', { sessionId: sessionIdRef.current })
         audioWebSocketRef.current = new AudioWebSocket(
           sessionIdRef.current,
           () => {}, // No transcription callback needed
           (response) => {
             // Handle chatbot response - ChatGPT style
-            logger.info('Chatbot response callback triggered', { 
-              hasResponse: !!response.response,
-              hasError: !!response.error,
-              hasTranscription: !!response.transcription,
-              currentQuestionId: currentQuestionRef.current
-            })
-            
             setIsProcessing(false)
             
-            // Update user message with actual transcription (ChatGPT shows user message immediately)
-            // This ensures the transcription is always visible in chat history
+            // Update user message with actual transcription
             if (response.transcription) {
               if (currentQuestionRef.current) {
-                logger.info('Updating user message with transcription', {
-                  questionId: currentQuestionRef.current,
-                  transcription: response.transcription.substring(0, 50)
-                })
                 setChatMessages((prev) => {
                   const updated = prev.map(msg => 
                     msg.id === currentQuestionRef.current && msg.type === 'user'
                       ? { ...msg, content: response.transcription! }
                       : msg
                   )
-                  // Log if message was found and updated
                   const found = updated.find(msg => msg.id === currentQuestionRef.current)
-                  if (found && found.content === response.transcription) {
-                    logger.info('User message successfully updated with transcription')
-                  } else {
-                    logger.warn('User message not found or not updated, adding new message', {
-                      questionId: currentQuestionRef.current,
-                      messagesInState: prev.map(m => ({ id: m.id, type: m.type }))
-                    })
+                  if (!found || found.content !== response.transcription) {
                     // If message not found, add it as a new user message
                     if (response.transcription) {
                       return [
@@ -381,9 +398,6 @@ function App() {
                 // No current question ID, but we have transcription - add it as a new message
                 const transcription = response.transcription
                 if (transcription) {
-                  logger.info('Adding transcription as new user message (no current question ID)', {
-                    transcription: transcription.substring(0, 50)
-                  })
                   setChatMessages((prev) => [
                     ...prev,
                     {
@@ -396,11 +410,6 @@ function App() {
                 }
               }
             } else if (!response.transcription && currentQuestionRef.current) {
-              logger.warn('No transcription received in chatbot response', {
-                questionId: currentQuestionRef.current,
-                hasResponse: !!response.response,
-                hasError: !!response.error
-              })
               // Keep the placeholder but mark it as transcribed (even without text)
               setChatMessages((prev) => prev.map(msg => 
                 msg.id === currentQuestionRef.current && msg.type === 'user' && msg.content === '🎤 [Transcribing...]'
@@ -464,14 +473,11 @@ function App() {
         const checkBackendHealth = async () => {
           try {
             const healthUrl = `${config.apiUrl}/health`
-            logger.info('Checking backend health', { url: healthUrl })
             const response = await fetch(healthUrl, { 
               method: 'GET',
               signal: AbortSignal.timeout(5000) // 5 second timeout
             })
             if (response.ok) {
-              const health = await response.json()
-              logger.info('Backend health check passed', health)
               return true
             } else {
               logger.warn('Backend health check failed', { status: response.status })
@@ -511,7 +517,6 @@ function App() {
         if (event.data.size > 0) {
           // CRITICAL: Don't send audio chunks while TTS is playing (prevents feedback loop)
           if (isTTSPlayingRef.current) {
-            logger.debug('Skipping audio chunk - TTS is playing')
             return
           }
           
@@ -519,18 +524,10 @@ function App() {
           // Send audio chunk to WebSocket for chatbot processing
           if (audioWebSocketRef.current && audioWebSocketRef.current.isConnected()) {
             audioWebSocketRef.current.sendAudioChunk(event.data)
-          } else {
-            logger.warn('WebSocket not connected, cannot send audio chunk')
           }
         }
       }
       mediaRecorder.onstop = async () => {
-        const currentSessionId = sessionIdRef.current || sessionId
-        logger.info('MediaRecorder stopped', { 
-          chunksCount: chunksRef.current.length,
-          sessionId: currentSessionId
-        })
-        
         // Clear chunks - no longer saving audio
         chunksRef.current = []
         
@@ -560,7 +557,8 @@ function App() {
       const SILENCE_RMS = BASE_SILENCE_RMS * (1 + sensitivity)
       const SPEECH_RMS = BASE_SPEECH_RMS * (1 + sensitivity * 2)
       const VOICE_THRESHOLD = SPEECH_RMS
-      const SILENCE_DURATION_MS = 300 // Ultra-fast response: 300ms silence threshold
+      const SILENCE_DURATION_MS = silenceDurationMsRef.current // Get from UI slider
+      const MIN_SPEECH_DURATION_MS = minSpeechDurationMsRef.current // Get from UI slider
 
       const data = new Float32Array(analyser.fftSize)
 
@@ -599,18 +597,29 @@ function App() {
         }
 
         // Don't record while TTS is playing (prevent feedback loop)
-        // BUT allow user barge-in: if user speaks during TTS, stop TTS and start recording
+        // BUT allow user barge-in: if user speaks during TTS, stop TTS immediately and start recording
+        // Also add a brief delay after TTS stops to prevent detecting TTS echo/artifacts
+        const timeSinceTTSStop = now - lastTTSStopTimeRef.current
+        const TTS_COOLDOWN_MS = 300 // Wait 300ms after TTS stops before allowing barge-in
+        
         if (isTTSPlayingRef.current) {
-          // User barge-in: if user speaks loudly during TTS, interrupt TTS and start recording
-          if (rms > VOICE_THRESHOLD * 1.5) { // Higher threshold for barge-in (user must speak louder)
-            logger.info('User barge-in detected during TTS - stopping TTS and starting recording')
+          // User barge-in: detect speech at normal threshold (or slightly lower for better responsiveness)
+          // Stop TTS immediately when user starts speaking
+          // Use slightly higher threshold to ensure it's real human speech, not TTS echo
+          if (rms > VOICE_THRESHOLD * 1.1) { // Higher threshold to avoid TTS feedback
             stopTTS()
-            // Fall through to start recording
+            setStatusText('Barge-in detected, listening...')
+            // Continue to recording logic below - TTS is now stopped, so recording can start
           } else {
             // TTS is playing and no user barge-in - skip recording
             rafIdRef.current = requestAnimationFrame(loop)
             return
           }
+        } else if (timeSinceTTSStop < TTS_COOLDOWN_MS) {
+          // TTS just stopped - ignore speech detection for a brief period to prevent false triggers
+          // This prevents detecting any residual echo or audio artifacts from TTS
+          rafIdRef.current = requestAnimationFrame(loop)
+          return
         }
 
         if (rms > VOICE_THRESHOLD) {
@@ -639,7 +648,6 @@ function App() {
                   for (let i = 0; i < retries; i++) {
                     try {
                       await audioWebSocketRef.current!.connect()
-                      logger.info('WebSocket connected successfully')
                       return true
                     } catch (err) {
                       logger.warn(`WebSocket connection attempt ${i + 1}/${retries} failed`, err)
@@ -677,10 +685,9 @@ function App() {
               }
               
               try {
-                mediaRecorder.start()
-                logger.info('MediaRecorder started', { sessionId: sessionIdRef.current })
+                // Start with 100ms timeslice to ensure ondataavailable fires regularly
+                mediaRecorder.start(100)
               } catch (err) {
-                console.error('❌ Failed to start MediaRecorder', err)
                 logger.error('Failed to start MediaRecorder', err)
                 return
               }
@@ -689,7 +696,6 @@ function App() {
         } else if (speakingRef.current) {
           // If TTS started while we were recording, stop immediately
           if (isTTSPlayingRef.current) {
-            logger.info('TTS started during recording - stopping recording immediately')
             speakingRef.current = false
             if (mediaRecorder.state === 'recording') {
               try {
@@ -703,16 +709,16 @@ function App() {
           }
           
           const silenceMs = now - lastSpeechTimeRef.current
-          if (silenceMs > SILENCE_DURATION_MS) {
-            // Speech just ended
-            console.log('🟡 Silence detected, speech ending', {
-              silenceMs,
-              mediaRecorderState: mediaRecorder.state,
-              timestamp: new Date().toISOString()
-            })
+          const speechStartTime = currentSpeechStartRef.current ?? lastSpeechTimeRef.current
+          const speechDurationMs = now - speechStartTime
+          
+          // Only end segment if:
+          // 1. Silence duration exceeds threshold (1 second) - gives user time to finish speaking
+          // 2. Speech duration is at least minimum required (1 second) - ensures we capture meaningful speech
+          if (silenceMs > SILENCE_DURATION_MS && speechDurationMs >= MIN_SPEECH_DURATION_MS) {
             speakingRef.current = false
 
-            const segmentStart = currentSpeechStartRef.current ?? lastSpeechTimeRef.current
+            const segmentStart = speechStartTime
             const segmentEnd = now
             const base = sessionStartRef.current ?? segmentStart
 
@@ -720,11 +726,6 @@ function App() {
             const endSec = (segmentEnd - base) / 1000
             const durationSec = (segmentEnd - segmentStart) / 1000
 
-            logger.debug('Speech segment timing', {
-              startSecondsFromSessionStart: startSec,
-              endSecondsFromSessionStart: endSec,
-              durationSeconds: durationSec,
-            })
 
             setSegments((prev) => [
               ...prev,
@@ -738,10 +739,7 @@ function App() {
 
             setStatusText('Silence detected, processing question...')
             if (mediaRecorder.state === 'recording') {
-              logger.info('Stopping recording due to silence', { sessionId })
-              
               // ChatGPT style: Add user message immediately with placeholder
-              // Will be updated with actual transcription when received
               const questionId = `user-${Date.now()}`
               currentQuestionRef.current = questionId
               setIsProcessing(true)
@@ -758,30 +756,47 @@ function App() {
               ])
               pendingUserMessageRef.current = questionId
               
-              // Send segment end to trigger chatbot response
-              if (audioWebSocketRef.current && audioWebSocketRef.current.isConnected()) {
-                logger.info('Sending segment_end to trigger chatbot response')
-                audioWebSocketRef.current.sendSegmentEnd()
-              } else {
-                logger.error('WebSocket not connected, cannot send segment_end')
+              // Request final data from MediaRecorder before stopping
+              try {
+                mediaRecorder.requestData()
+              } catch (err) {
+                logger.warn('Failed to request data from MediaRecorder', err)
+              }
+              
+              // Stop the recorder - this will trigger ondataavailable for final chunk
+              try {
+                mediaRecorder.stop()
+              } catch (err) {
+                logger.error('Failed to stop MediaRecorder', err)
                 setIsProcessing(false)
-                // Remove the user message we just added
                 setChatMessages((prev) => prev.filter(msg => msg.id !== questionId))
                 pendingUserMessageRef.current = null
-                setError('WebSocket not connected')
+                setError('Failed to stop recording')
+                return
               }
+              
+              // Wait a brief moment for final audio chunk to be sent via ondataavailable
+              // Then send segment_end
+              setTimeout(() => {
+                if (audioWebSocketRef.current && audioWebSocketRef.current.isConnected()) {
+                  audioWebSocketRef.current.sendSegmentEnd()
+                } else {
+                  logger.error('WebSocket not connected, cannot send segment_end')
+                  setIsProcessing(false)
+                  setChatMessages((prev) => prev.filter(msg => msg.id !== questionId))
+                  pendingUserMessageRef.current = null
+                  setError('WebSocket not connected')
+                }
+              }, 200) // 200ms delay to ensure final chunk is sent
               
               // Stop MediaRecorder
               setTimeout(() => {
                 if (mediaRecorder.state === 'recording' && !isTTSPlayingRef.current) {
-                  logger.info('Stopping MediaRecorder', { sessionId })
                   try {
                     mediaRecorder.stop()
                   } catch (err) {
                     logger.warn('Error stopping MediaRecorder', err)
                   }
-                } else if (isTTSPlayingRef.current) {
-                  logger.info('TTS started - MediaRecorder will be stopped by TTS handler')
                 }
               }, 300)
             } else {
@@ -950,7 +965,6 @@ function App() {
           // Check for standalone "start" wake word (must be at the beginning or after a short pause)
           const startMatch = lower.match(/^\s*start\s*$|^\s*start\s+/)
           if (startMatch) {
-            logger.debug('[WakeWord] "Start" detected – stopping wake word detection and arming VAD')
             wakeTriggeredRef.current = true
             setWakeEverTriggered(true)
             wakeEverTriggeredRef.current = true
@@ -1027,7 +1041,6 @@ function App() {
 
           // "Hey AI" works without intent, but log if intent is present
           if (hasIntent) {
-            logger.debug('[WakeWord] "Hey AI" + intent detected – stopping wake word detection and arming VAD')
             wakeTriggeredRef.current = true
             setWakeEverTriggered(true)
             wakeEverTriggeredRef.current = true
@@ -1063,7 +1076,6 @@ function App() {
             }
           } else {
             // "Hey AI" without intent still works, but log it
-            logger.debug('[WakeWord] "Hey AI" detected (no intent keywords) – stopping wake word detection and arming VAD')
             wakeTriggeredRef.current = true
             setWakeEverTriggered(true)
             wakeEverTriggeredRef.current = true
@@ -1137,12 +1149,10 @@ function App() {
         setIsTTSPlaying(true)
         isTTSPlayingRef.current = true
         setStatusText('Playing response...')
-        logger.info('TTS started', { textLength: text.length })
         addLog('system', 'TTS started', `Playing: ${text.substring(0, 50)}...`)
         
         // Stop any active recording when TTS starts (prevent feedback loop)
         if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-          logger.info('Stopping recording because TTS started')
           try {
             mediaRecorderRef.current.stop()
             speakingRef.current = false
@@ -1157,10 +1167,10 @@ function App() {
         setIsTTSPlaying(false)
         isTTSPlayingRef.current = false
         ttsUtteranceRef.current = null
-        logger.info('TTS ended')
+        lastTTSStopTimeRef.current = performance.now() // Track when TTS stopped naturally
         addLog('system', 'TTS ended')
         
-        // After TTS ends, allow recording to resume
+        // After TTS ends, allow recording to resume (after cooldown period)
         if (wakeModeRef.current) {
           setStatusText('Waiting for wake word: say "Hey AI" or "start"...')
           // Reset wake trigger to allow new wake word detection
@@ -1174,6 +1184,7 @@ function App() {
         setIsTTSPlaying(false)
         isTTSPlayingRef.current = false
         ttsUtteranceRef.current = null
+        lastTTSStopTimeRef.current = performance.now() // Track when TTS stopped due to error
         logger.error('TTS error', event)
       }
 
@@ -1193,7 +1204,7 @@ function App() {
     setIsTTSPlaying(false)
     isTTSPlayingRef.current = false
     ttsUtteranceRef.current = null
-    logger.info('TTS stopped')
+    lastTTSStopTimeRef.current = performance.now() // Track when TTS stopped
     addLog('system', 'TTS stopped')
   }
 
@@ -1276,11 +1287,19 @@ function App() {
             </div>
           </div>
           
-          {/* Chat Messages */}
+          {/* Chat Messages - Newest at top, scrollable */}
           <div 
             ref={chatContainerRef}
-            className="p-6 max-h-96 overflow-y-auto flex flex-col" 
-            style={{ minHeight: '200px' }}
+            className="p-6 overflow-y-auto flex flex-col-reverse chat-scrollbar" 
+            style={{ 
+              minHeight: '200px',
+              maxHeight: '600px',
+              scrollBehavior: 'smooth',
+              // Better scrolling experience
+              WebkitOverflowScrolling: 'touch',
+              scrollbarWidth: 'thin',
+              scrollbarColor: 'rgba(217, 119, 6, 0.5) rgba(31, 41, 55, 0.3)'
+            }}
           >
             {chatMessages.length === 0 && !isProcessing ? (
               <div className="text-center py-12 text-gray-400 flex-1 flex items-center justify-center">
@@ -1290,8 +1309,24 @@ function App() {
                 </div>
               </div>
             ) : (
-              <div className="space-y-4 flex flex-col">
-                {chatMessages.map((msg) => (
+              <div className="space-y-4 flex flex-col-reverse">
+                {/* Show thinking indicator at top if processing */}
+                {isProcessing && (
+                  <div className="flex justify-start">
+                    <div className="max-w-[80%] rounded-lg p-4 border-2 bg-dark-800 border-gold-500/50">
+                      <div className="flex items-center gap-2 text-gold-300">
+                        <div className="flex gap-1">
+                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                        </div>
+                        <span className="text-sm">Thinking...</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {/* Display messages in reverse order (newest first) */}
+                {[...chatMessages].reverse().map((msg) => (
                   <div
                     key={msg.id}
                     className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}
@@ -1317,23 +1352,6 @@ function App() {
                     </div>
                   </div>
                 ))}
-                {/* ChatGPT-style thinking indicator */}
-                {isProcessing && (
-                  <div className="flex justify-start">
-                    <div className="max-w-[80%] rounded-lg p-4 border-2 bg-dark-800 border-gold-500/50">
-                      <div className="flex items-center gap-2 text-gold-300">
-                        <div className="flex gap-1">
-                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
-                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
-                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
-                        </div>
-                        <span className="text-sm">Thinking...</span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                {/* Invisible element at bottom for scroll target */}
-                <div ref={chatMessagesEndRef} />
               </div>
             )}
           </div>
@@ -1440,6 +1458,84 @@ function App() {
                   <span>More Sensitive</span>
                   <span>Less Sensitive</span>
                   </div>
+              </div>
+            </div>
+
+            {/* Speech Buffer Duration Settings */}
+            <div className="rounded-xl p-6 border-2 mt-4" style={{ backgroundColor: 'rgba(31, 41, 55, 0.7)', borderColor: 'rgba(59, 130, 246, 0.4)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-sm font-semibold text-blue-300 uppercase tracking-wider">Speech Buffer Duration</h3>
+                </div>
+                <p className="text-xs text-gray-400 mb-4">
+                  Control how long the system waits before processing speech. Higher values give more time to speak.
+                </p>
+                
+                {/* Silence Duration Slider */}
+                <div className="mb-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-xs text-blue-200 font-medium">Silence Duration (ms)</label>
+                    <span className="text-xs text-blue-400 font-semibold">
+                      {silenceDurationMs}ms
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 mb-2">
+                    Time to wait after speech ends before processing (default: 1000ms)
+                  </p>
+                  <input
+                    type="range"
+                    min="300"
+                    max="3000"
+                    step="100"
+                    value={silenceDurationMs}
+                    onChange={(e) => {
+                      const newValue = parseInt(e.target.value)
+                      setSilenceDurationMs(newValue)
+                      silenceDurationMsRef.current = newValue
+                    }}
+                    className="w-full h-2 bg-dark-900 rounded-lg appearance-none cursor-pointer"
+                    style={{
+                      background: `linear-gradient(to right, #3b82f6 0%, #3b82f6 ${((silenceDurationMs - 300) / (3000 - 300)) * 100}%, #374151 ${((silenceDurationMs - 300) / (3000 - 300)) * 100}%, #374151 100%)`
+                    }}
+                  />
+                  <div className="flex justify-between text-xs text-gray-500 mt-1">
+                    <span>300ms</span>
+                    <span>3000ms</span>
+                  </div>
+                </div>
+
+                {/* Minimum Speech Duration Slider */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-xs text-blue-200 font-medium">Min Speech Duration (ms)</label>
+                    <span className="text-xs text-blue-400 font-semibold">
+                      {minSpeechDurationMs}ms
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 mb-2">
+                    Minimum speech length required before processing (default: 1000ms)
+                  </p>
+                  <input
+                    type="range"
+                    min="300"
+                    max="3000"
+                    step="100"
+                    value={minSpeechDurationMs}
+                    onChange={(e) => {
+                      const newValue = parseInt(e.target.value)
+                      setMinSpeechDurationMs(newValue)
+                      minSpeechDurationMsRef.current = newValue
+                    }}
+                    className="w-full h-2 bg-dark-900 rounded-lg appearance-none cursor-pointer"
+                    style={{
+                      background: `linear-gradient(to right, #3b82f6 0%, #3b82f6 ${((minSpeechDurationMs - 300) / (3000 - 300)) * 100}%, #374151 ${((minSpeechDurationMs - 300) / (3000 - 300)) * 100}%, #374151 100%)`
+                    }}
+                  />
+                  <div className="flex justify-between text-xs text-gray-500 mt-1">
+                    <span>300ms</span>
+                    <span>3000ms</span>
+                  </div>
+                </div>
               </div>
             </div>
 

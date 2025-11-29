@@ -110,6 +110,10 @@ export class AudioWebSocket {
   private isIntentionallyDisconnected: boolean = false
   private shouldAutoReconnect: boolean = true
   private connectionPromise: Promise<void> | null = null
+  
+  // Session readiness tracking
+  private sessionAcknowledged: boolean = false
+  private pendingSegmentEnd: boolean = false // Queue segment_end if sent before session_ack
 
   constructor(
     sessionId: string,
@@ -131,7 +135,6 @@ export class AudioWebSocket {
 
     // If already connected, return immediately
     if (this.isConnected()) {
-      logger.debug('WebSocket already connected')
       return Promise.resolve()
     }
 
@@ -164,7 +167,7 @@ export class AudioWebSocket {
           }
           this.connectionPromise = null
           // Auto-reconnect on timeout (like web speech service)
-          this.scheduleReconnect('Connection timeout')
+          this.scheduleReconnect()
           reject(new Error(`WebSocket connection timeout. Please ensure the backend server is running at ${apiUrl}`))
         }
       }, 10000) // 10 second timeout
@@ -177,7 +180,7 @@ export class AudioWebSocket {
         logger.error('Failed to create WebSocket', { error: errorMsg, url: fullWsUrl })
         this.connectionPromise = null
         // Auto-reconnect on creation failure
-        this.scheduleReconnect(`Failed to create WebSocket: ${errorMsg}`)
+        this.scheduleReconnect()
         reject(new Error(`Failed to create WebSocket connection: ${errorMsg}. Check if backend is running at ${apiUrl}`))
         return
       }
@@ -188,6 +191,9 @@ export class AudioWebSocket {
         this.reconnectAttempts = 0
         this.reconnectDelay = 2000 // Reset delay
         this.connectionPromise = null
+        // Reset session acknowledgment state on new connection
+        this.sessionAcknowledged = false
+        this.pendingSegmentEnd = false
         logger.info('WebSocket connected successfully', { 
           url: fullWsUrl,
           reconnectAttempts: this.reconnectAttempts
@@ -212,33 +218,22 @@ export class AudioWebSocket {
           const message = JSON.parse(event.data)
           
           if (message.type === 'session_ack') {
-            logger.info('Session acknowledged by server', { sessionId: message.session_id })
+            this.sessionAcknowledged = true
+            // If there's a pending segment_end, send it now
+            if (this.pendingSegmentEnd) {
+              this.pendingSegmentEnd = false
+              this.sendSegmentEndInternal()
+            }
           } else if (message.type === 'transcription') {
             if (this.onTranscription && message.text) {
-              logger.info('Received transcription from WebSocket', { 
-                textLength: message.text.length,
-                preview: message.text.substring(0, 50),
-                speaker: message.speaker_label || 'Unknown'
-              })
               this.onTranscription({
                 text: message.text,
                 speaker_label: message.speaker_label,
                 speaker_id: message.speaker_id
               })
-            } else {
-              logger.warn('Transcription received but callback not available or text is empty', {
-                hasCallback: !!this.onTranscription,
-                hasText: !!message.text
-              })
             }
           } else if (message.type === 'chatbot_response') {
             if (this.onChatbotResponse) {
-              logger.info('Received chatbot response from WebSocket', {
-                hasResponse: !!message.response,
-                hasTranscription: !!message.transcription,
-                backend: message.backend_used,
-                error: message.error
-              })
               this.onChatbotResponse({
                 response: message.response || null,
                 backend_used: message.backend_used,
@@ -246,18 +241,12 @@ export class AudioWebSocket {
                 transcription: message.transcription || undefined
               })
             }
-          } else if (message.type === 'chunk_received') {
-            logger.debug('Audio chunk acknowledged by server')
-          } else if (message.type === 'segment_processed') {
-            logger.info('Speech segment processed by server')
           } else if (message.type === 'error') {
             const error = new Error(message.message || 'WebSocket error')
             logger.error('WebSocket error message received', { message: message.message })
             if (this.onError) {
               this.onError(error)
             }
-          } else {
-            logger.debug('Unknown WebSocket message type', { type: message.type })
           }
         } catch (err) {
           logger.error('Failed to parse WebSocket message', err)
@@ -280,6 +269,9 @@ export class AudioWebSocket {
       this.ws.onclose = (event) => {
         clearTimeout(connectionTimeout)
         this.connectionPromise = null
+        // Reset session state on disconnect
+        this.sessionAcknowledged = false
+        this.pendingSegmentEnd = false
         logger.info('WebSocket closed', { 
           code: event.code, 
           reason: event.reason, 
@@ -309,7 +301,7 @@ export class AudioWebSocket {
             reason: event.reason || 'No reason provided',
             attempt: this.reconnectAttempts + 1
           })
-          this.scheduleReconnect(event.reason || `Unexpected close (code: ${event.code})`)
+          this.scheduleReconnect()
         } else if (this.reconnectAttempts >= this.maxReconnectAttempts) {
           logger.error('WebSocket max reconnection attempts reached', {
             maxAttempts: this.maxReconnectAttempts
@@ -329,17 +321,15 @@ export class AudioWebSocket {
     return this.connectionPromise
   }
 
-  private scheduleReconnect(reason: string): void {
+  private scheduleReconnect(): void {
     // Prevent multiple simultaneous reconnection attempts
     if (this.reconnectTimeout !== null) {
-      logger.debug('Reconnection already scheduled, skipping')
-      return
-    }
+        return
+      }
 
-    if (!this.shouldAutoReconnect) {
-      logger.debug('Auto-reconnect disabled, not scheduling reconnect')
-      return
-    }
+      if (!this.shouldAutoReconnect) {
+        return
+      }
 
     this.reconnectAttempts++
     const delay = Math.min(this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1), 30000) // Max 30 seconds
@@ -347,8 +337,7 @@ export class AudioWebSocket {
     logger.info('Scheduling WebSocket reconnection', {
       attempt: this.reconnectAttempts,
       maxAttempts: this.maxReconnectAttempts,
-      delayMs: delay,
-      reason
+      delayMs: delay
     })
 
     this.reconnectTimeout = window.setTimeout(() => {
@@ -356,8 +345,7 @@ export class AudioWebSocket {
       // Only reconnect if we should and we're not already connected
       if (this.shouldAutoReconnect && !this.isConnected()) {
         logger.info('Attempting WebSocket reconnection', {
-          attempt: this.reconnectAttempts,
-          maxAttempts: this.maxReconnectAttempts
+          attempt: this.reconnectAttempts
         })
         this.connect().catch((err) => {
           logger.error('Reconnection attempt failed', err)
@@ -368,21 +356,41 @@ export class AudioWebSocket {
   }
 
   sendAudioChunk(chunk: Blob): void {
+    logger.debug('📤 sendAudioChunk() called', {
+      sessionId: this.sessionId,
+      chunkSize: chunk.size,
+      wsReady: this.ws?.readyState === WebSocket.OPEN,
+      wsReadyState: this.ws?.readyState,
+      isConnected: this.isConnected(),
+      sessionAcknowledged: this.sessionAcknowledged,
+      timestamp: new Date().toISOString()
+    })
+
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      logger.warn('WebSocket not connected, cannot send audio chunk - will auto-reconnect', {
+      logger.warn('⚠️ WebSocket not connected, cannot send audio chunk - will auto-reconnect', {
         readyState: this.ws?.readyState,
-        isConnected: this.isConnected()
+        isConnected: this.isConnected(),
+        sessionId: this.sessionId,
+        chunkSize: chunk.size
       })
       // If auto-reconnect is enabled and we're not connected, try to reconnect
       if (this.shouldAutoReconnect && !this.isConnected() && !this.connectionPromise) {
-        logger.info('Attempting to reconnect WebSocket for audio chunk')
+        logger.info('🔄 Attempting to reconnect WebSocket for audio chunk')
         this.connect().catch((err) => {
-          logger.warn('Failed to reconnect for audio chunk', err)
+          logger.warn('❌ Failed to reconnect for audio chunk', err)
           // Auto-reconnect will continue trying
         })
       }
       return
     }
+
+    // Note: Audio chunks can be sent even if session isn't acknowledged yet
+    // Only segment_end needs to wait for session_ack
+    logger.debug('✅ WebSocket ready, converting audio chunk to base64', {
+      sessionId: this.sessionId,
+      chunkSize: chunk.size,
+      sessionAcknowledged: this.sessionAcknowledged
+    })
 
     // Convert blob to base64
     const reader = new FileReader()
@@ -398,7 +406,7 @@ export class AudioWebSocket {
           logger.error('Failed to send audio chunk', err)
           // If send fails, try to reconnect
           if (this.shouldAutoReconnect && !this.connectionPromise) {
-            this.scheduleReconnect('Send failed')
+            this.scheduleReconnect()
           }
         }
       }
@@ -408,18 +416,27 @@ export class AudioWebSocket {
 
   sendSegmentEnd(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      logger.warn('WebSocket not connected, cannot send segment end - will auto-reconnect', {
-        readyState: this.ws?.readyState,
-        isConnected: this.isConnected()
-      })
       // If auto-reconnect is enabled and we're not connected, try to reconnect
       if (this.shouldAutoReconnect && !this.isConnected() && !this.connectionPromise) {
-        logger.info('Attempting to reconnect WebSocket for segment end')
-        this.connect().catch((err) => {
-          logger.warn('Failed to reconnect for segment end', err)
+        this.connect().catch(() => {
           // Auto-reconnect will continue trying
         })
       }
+      return
+    }
+
+    // If session hasn't been acknowledged yet, queue the segment_end
+    if (!this.sessionAcknowledged) {
+      this.pendingSegmentEnd = true
+      return
+    }
+
+    this.sendSegmentEndInternal()
+  }
+
+  private sendSegmentEndInternal(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      logger.error('WebSocket not ready for segment_end')
       return
     }
 
@@ -431,7 +448,7 @@ export class AudioWebSocket {
       logger.error('Failed to send segment end', err)
       // If send fails, try to reconnect
       if (this.shouldAutoReconnect && !this.connectionPromise) {
-        this.scheduleReconnect('Send segment_end failed')
+        this.scheduleReconnect()
       }
     }
   }

@@ -36,12 +36,20 @@ VadBasedRecorder/
 
 - **Node.js** 18+ and npm
 - **Python** 3.9+
+- **FFmpeg** (required for audio processing)
 - **Modern browser** with WebRTC support (Chrome, Firefox, Edge, Safari)
+- **GPU** (optional): NVIDIA GPU with CUDA for faster processing
 
 ## Quick Start
 
 ### 1. Backend Setup
 
+Choose your setup based on your hardware:
+
+- **CPU Setup** (No GPU): Follow [backend/CPU_SETUP.md](backend/CPU_SETUP.md)
+- **GPU Setup** (NVIDIA GPU): Follow [backend/GPU_SETUP.md](backend/GPU_SETUP.md)
+
+**Quick Start (CPU)**:
 ```bash
 cd backend
 python -m venv .venv
@@ -55,6 +63,8 @@ source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
+
+For GPU setup, see [backend/GPU_SETUP.md](backend/GPU_SETUP.md) for CUDA installation instructions.
 
 ### 2. Frontend Setup
 
