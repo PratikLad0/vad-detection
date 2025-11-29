@@ -1,0 +1,10 @@
+# Test reports
+test_reports/
+*.html
+*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+

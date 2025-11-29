@@ -1,0 +1,43 @@
+# GPU-Enabled Requirements
+# 
+# IMPORTANT: Install CUDA-enabled PyTorch FIRST before installing other packages
+# 
+# Step 1: Uninstall CPU-only PyTorch
+#   pip uninstall torch torchvision torchaudio
+#
+# Step 2: Install CUDA-enabled PyTorch (choose one based on your CUDA version)
+#   For CUDA 12.4 (latest, recommended):
+#     Note: Use cu121 wheels (backward compatible with CUDA 12.4)
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   For CUDA 12.1:
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   For CUDA 11.8:
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+# Step 3: Install other requirements
+#   pip install -r requirements.txt
+
+# All other requirements are the same as requirements.txt
+# This file is just for documentation - use requirements.txt after installing CUDA PyTorch
+
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17
+pydantic==2.9.2
+websockets==13.1
+openai-whisper==20231117
+# torch, torchaudio - Install with CUDA support (see instructions above)
+numpy==1.24.3
+ffmpeg-python==0.2.0
+speechbrain>=1.0.0
+scikit-learn==1.3.2
+librosa==0.10.1
+llama-cpp-python==0.2.20
+openai==1.3.0
+transformers==4.35.0
+python-dotenv==1.0.0
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-timeout==2.2.0
+requests==2.31.0
+

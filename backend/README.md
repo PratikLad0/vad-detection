@@ -6,6 +6,32 @@ FastAPI backend for the VAD-based audio recorder. Handles file uploads, storage,
 
 - **Python** 3.9+
 - **pip** (Python package manager)
+- **FFmpeg** (required for Whisper audio processing)
+- **RAM**: Minimum 4GB, 8GB+ recommended (for Hugging Face models)
+- **Storage**: 5-10GB free space (for models and dependencies)
+- **GPU** (optional): NVIDIA GPU with CUDA for faster Hugging Face inference
+
+### Installing FFmpeg
+
+**Windows:**
+1. Download FFmpeg from: https://www.gyan.dev/ffmpeg/builds/
+2. Extract the zip file to a location (e.g., `C:\ffmpeg`)
+3. Add FFmpeg to your system PATH:
+   - Open System Properties → Environment Variables
+   - Edit the "Path" variable
+   - Add the path to the `bin` folder (e.g., `C:\ffmpeg\bin`)
+4. Verify installation: Open PowerShell/CMD and run `ffmpeg -version`
+
+**Linux:**
+```bash
+sudo apt-get update
+sudo apt-get install ffmpeg
+```
+
+**macOS:**
+```bash
+brew install ffmpeg
+```
 
 ## Installation
 
@@ -30,6 +56,11 @@ source .venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
+
+**Note on Hugging Face:**
+- Models download automatically on first use (350MB-1.5GB depending on model)
+- For CPU usage: No additional setup needed
+- For GPU usage: Install CUDA toolkit and ensure GPU drivers are compatible
 
 ## Development
 
@@ -244,6 +275,8 @@ The application logs to stdout/stderr. For production, consider:
 
 ## Testing
 
+### Manual API Testing
+
 ```bash
 # Test health endpoint
 curl http://localhost:8000/health
@@ -251,6 +284,42 @@ curl http://localhost:8000/health
 # Test file upload
 curl -X POST -F "file=@test.webm" http://localhost:8000/upload
 ```
+
+### Automated Performance Tests
+
+Run comprehensive performance tests with automatic reporting:
+
+```bash
+# Run all tests (reports generated automatically)
+pytest tests/ -v
+
+# Run specific test categories
+pytest tests/test_transcription_performance.py -v
+pytest tests/test_chatbot_performance.py -v
+pytest tests/test_websocket_integration.py -v
+pytest tests/test_frontend_simulation.py -v
+
+# Run with detailed output
+pytest tests/ -v -s
+```
+
+### Test Reports
+
+Tests automatically generate comprehensive HTML and JSON reports with:
+- **Performance Metrics**: Average, min, max, median, P95, P99, standard deviation
+- **Category Analysis**: Transcription, chatbot, WebSocket, end-to-end
+- **Performance Targets**: Automatic comparison against targets
+- **Recommendations**: Actionable performance improvement suggestions
+
+Reports are saved to `backend/test_reports/` after each test run.
+
+**View HTML Report:**
+```bash
+# Find and open latest report
+python -c "from pathlib import Path; import webbrowser; report = max(Path('test_reports').glob('*.html'), key=lambda p: p.stat().st_mtime); webbrowser.open(f'file://{report.absolute()}')"
+```
+
+See [tests/README_REPORTING.md](tests/README_REPORTING.md) for detailed documentation.
 
 ## License
 

@@ -70,64 +70,6 @@ export async function fetchWithRetry(
   throw lastError || new Error('Request failed after all retries')
 }
 
-export async function uploadFile(
-  file: Blob,
-  filename: string = 'recording.webm'
-): Promise<{ status: string; filename: string }> {
-  const formData = new FormData()
-  formData.append('file', file, filename)
-
-  const response = await fetchWithRetry(`${config.apiUrl}/upload`, {
-    method: 'POST',
-    body: formData,
-  })
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Upload failed: ${response.status} ${errorText}`)
-  }
-
-  return response.json()
-}
-
-export async function uploadTextFile(
-  text: string,
-  filename: string = 'transcription.txt'
-): Promise<{ status: string; filename: string }> {
-  const formData = new FormData()
-  const blob = new Blob([text], { type: 'text/plain' })
-  formData.append('file', blob, filename)
-
-  const response = await fetchWithRetry(`${config.apiUrl}/upload`, {
-    method: 'POST',
-    body: formData,
-  })
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Upload failed: ${response.status} ${errorText}`)
-  }
-
-  return response.json()
-}
-
-export async function sendTranscriptionText(
-  text: string,
-  sessionId: string
-): Promise<{ status: string; message: string }> {
-  const response = await fetchWithRetry(`${config.apiUrl}/transcription`, {
-    method: 'POST',
-    body: JSON.stringify({ text, session_id: sessionId }),
-  })
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Failed to send transcription: ${response.status} ${errorText}`)
-  }
-
-  return response.json()
-}
-
 export async function healthCheck(): Promise<boolean> {
   try {
     const response = await fetchWithRetry(`${config.apiUrl}/health`, {
@@ -139,80 +81,415 @@ export async function healthCheck(): Promise<boolean> {
   }
 }
 
-export interface Recording {
-  filename: string
-  size: number
-  modified: string
+// WebSocket for real-time audio streaming
+export interface TranscriptionMessage {
+  text: string
+  speaker_label?: string
+  speaker_id?: number
 }
 
-export interface TranscriptionLog {
-  session_id: string
-  filename: string
-  size: number
-  modified: string
-  entry_count: number
-  first_entry: string
+export interface ChatbotResponse {
+  response: string | null
+  backend_used?: string
+  error?: string | null
+  transcription?: string  // User's question transcription
 }
 
-export async function getRecordings(): Promise<Recording[]> {
-  const response = await fetchWithRetry(`${config.apiUrl}/recordings`, {
-    method: 'GET',
-  })
+export class AudioWebSocket {
+  private ws: WebSocket | null = null
+  private sessionId: string | null = null
+  private onTranscription: ((message: TranscriptionMessage) => void) | null = null
+  private onChatbotResponse: ((response: ChatbotResponse) => void) | null = null
+  private onError: ((error: Error) => void) | null = null
+  
+  // Robustness features (like web speech service)
+  private reconnectTimeout: number | null = null
+  private reconnectAttempts: number = 0
+  private maxReconnectAttempts: number = 10 // Allow many retries like web speech
+  private reconnectDelay: number = 2000 // Start with 2 seconds
+  private isIntentionallyDisconnected: boolean = false
+  private shouldAutoReconnect: boolean = true
+  private connectionPromise: Promise<void> | null = null
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Failed to fetch recordings: ${response.status} ${errorText}`)
+  constructor(
+    sessionId: string,
+    onTranscription: (message: TranscriptionMessage) => void,
+    onChatbotResponse?: (response: ChatbotResponse) => void,
+    onError?: (error: Error) => void
+  ) {
+    this.sessionId = sessionId
+    this.onTranscription = onTranscription
+    this.onChatbotResponse = onChatbotResponse || null
+    this.onError = onError || null
   }
 
-  const data = await response.json()
-  return data.recordings || []
-}
+  async connect(): Promise<void> {
+    // If already connecting, return the existing promise
+    if (this.connectionPromise) {
+      return this.connectionPromise
+    }
 
-export async function getTranscriptionLogs(): Promise<TranscriptionLog[]> {
-  const response = await fetchWithRetry(`${config.apiUrl}/transcription-logs`, {
-    method: 'GET',
-  })
+    // If already connected, return immediately
+    if (this.isConnected()) {
+      logger.debug('WebSocket already connected')
+      return Promise.resolve()
+    }
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Failed to fetch transcription logs: ${response.status} ${errorText}`)
+    // Clear any pending reconnect
+    if (this.reconnectTimeout !== null) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
+
+    this.connectionPromise = new Promise((resolve, reject) => {
+      // Get API URL from config
+      const apiUrl = config.apiUrl
+      const wsUrl = apiUrl.replace('http://', 'ws://').replace('https://', 'wss://')
+      const fullWsUrl = `${wsUrl}/ws/audio`
+      
+      logger.info('Attempting WebSocket connection', { 
+        url: fullWsUrl, 
+        apiUrl,
+        attempt: this.reconnectAttempts + 1,
+        maxAttempts: this.maxReconnectAttempts
+      })
+      
+      // Set a connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
+          logger.error('WebSocket connection timeout', { url: fullWsUrl })
+          if (this.ws) {
+            this.ws.close()
+            this.ws = null
+          }
+          this.connectionPromise = null
+          // Auto-reconnect on timeout (like web speech service)
+          this.scheduleReconnect('Connection timeout')
+          reject(new Error(`WebSocket connection timeout. Please ensure the backend server is running at ${apiUrl}`))
+        }
+      }, 10000) // 10 second timeout
+
+      try {
+        this.ws = new WebSocket(fullWsUrl)
+      } catch (err) {
+        clearTimeout(connectionTimeout)
+        const errorMsg = err instanceof Error ? err.message : 'Unknown error'
+        logger.error('Failed to create WebSocket', { error: errorMsg, url: fullWsUrl })
+        this.connectionPromise = null
+        // Auto-reconnect on creation failure
+        this.scheduleReconnect(`Failed to create WebSocket: ${errorMsg}`)
+        reject(new Error(`Failed to create WebSocket connection: ${errorMsg}. Check if backend is running at ${apiUrl}`))
+        return
+      }
+
+      this.ws.onopen = () => {
+        clearTimeout(connectionTimeout)
+        // Reset reconnect attempts on successful connection
+        this.reconnectAttempts = 0
+        this.reconnectDelay = 2000 // Reset delay
+        this.connectionPromise = null
+        logger.info('WebSocket connected successfully', { 
+          url: fullWsUrl,
+          reconnectAttempts: this.reconnectAttempts
+        })
+        // Send session ID
+        if (this.ws && this.sessionId) {
+          try {
+            this.ws.send(JSON.stringify({
+              type: 'session',
+              session_id: this.sessionId,
+            }))
+            logger.info('Session ID sent to server', { sessionId: this.sessionId })
+          } catch (err) {
+            logger.error('Failed to send session ID', err)
+          }
+        }
+        resolve()
+      }
+
+      this.ws.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data)
+          
+          if (message.type === 'session_ack') {
+            logger.info('Session acknowledged by server', { sessionId: message.session_id })
+          } else if (message.type === 'transcription') {
+            if (this.onTranscription && message.text) {
+              logger.info('Received transcription from WebSocket', { 
+                textLength: message.text.length,
+                preview: message.text.substring(0, 50),
+                speaker: message.speaker_label || 'Unknown'
+              })
+              this.onTranscription({
+                text: message.text,
+                speaker_label: message.speaker_label,
+                speaker_id: message.speaker_id
+              })
+            } else {
+              logger.warn('Transcription received but callback not available or text is empty', {
+                hasCallback: !!this.onTranscription,
+                hasText: !!message.text
+              })
+            }
+          } else if (message.type === 'chatbot_response') {
+            if (this.onChatbotResponse) {
+              logger.info('Received chatbot response from WebSocket', {
+                hasResponse: !!message.response,
+                hasTranscription: !!message.transcription,
+                backend: message.backend_used,
+                error: message.error
+              })
+              this.onChatbotResponse({
+                response: message.response || null,
+                backend_used: message.backend_used,
+                error: message.error || null,
+                transcription: message.transcription || undefined
+              })
+            }
+          } else if (message.type === 'chunk_received') {
+            logger.debug('Audio chunk acknowledged by server')
+          } else if (message.type === 'segment_processed') {
+            logger.info('Speech segment processed by server')
+          } else if (message.type === 'error') {
+            const error = new Error(message.message || 'WebSocket error')
+            logger.error('WebSocket error message received', { message: message.message })
+            if (this.onError) {
+              this.onError(error)
+            }
+          } else {
+            logger.debug('Unknown WebSocket message type', { type: message.type })
+          }
+        } catch (err) {
+          logger.error('Failed to parse WebSocket message', err)
+        }
+      }
+
+      this.ws.onerror = (error) => {
+        clearTimeout(connectionTimeout)
+        logger.error('WebSocket error event', { 
+          error, 
+          url: fullWsUrl,
+          readyState: this.ws?.readyState,
+          apiUrl,
+          reconnectAttempts: this.reconnectAttempts
+        })
+        // Don't reject immediately - let onclose handle reconnection
+        // This matches web speech service behavior (errors are handled gracefully)
+      }
+
+      this.ws.onclose = (event) => {
+        clearTimeout(connectionTimeout)
+        this.connectionPromise = null
+        logger.info('WebSocket closed', { 
+          code: event.code, 
+          reason: event.reason, 
+          wasClean: event.wasClean,
+          url: fullWsUrl,
+          intentionallyDisconnected: this.isIntentionallyDisconnected
+        })
+        
+        // Don't auto-reconnect if intentionally disconnected
+        if (this.isIntentionallyDisconnected) {
+          logger.info('WebSocket intentionally disconnected - not auto-reconnecting')
+          this.isIntentionallyDisconnected = false
+          return
+        }
+
+        // Handle different close codes (like web speech service handles different errors)
+        if (event.code === 1000 || event.code === 1001) {
+          // Normal closure - don't reconnect
+          logger.info('WebSocket closed normally')
+          return
+        }
+
+        // Unexpected closure - auto-reconnect (like web speech service auto-restarts)
+        if (this.shouldAutoReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
+          logger.warn('WebSocket closed unexpectedly - scheduling reconnect', { 
+            code: event.code, 
+            reason: event.reason || 'No reason provided',
+            attempt: this.reconnectAttempts + 1
+          })
+          this.scheduleReconnect(event.reason || `Unexpected close (code: ${event.code})`)
+        } else if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+          logger.error('WebSocket max reconnection attempts reached', {
+            maxAttempts: this.maxReconnectAttempts
+          })
+          const errorMessage = `WebSocket connection failed after ${this.maxReconnectAttempts} attempts. Please ensure:
+1. Backend server is running at ${apiUrl}
+2. Backend server is accessible from your browser
+3. CORS is properly configured
+4. No firewall is blocking the connection`
+          if (this.onError) {
+            this.onError(new Error(errorMessage))
+          }
+        }
+      }
+    })
+
+    return this.connectionPromise
   }
 
-  const data = await response.json()
-  return data.logs || []
-}
+  private scheduleReconnect(reason: string): void {
+    // Prevent multiple simultaneous reconnection attempts
+    if (this.reconnectTimeout !== null) {
+      logger.debug('Reconnection already scheduled, skipping')
+      return
+    }
 
-export interface TranscriptionLogContent {
-  session_id: string
-  filename: string
-  content: string
-  size: number
-  modified: string
-}
+    if (!this.shouldAutoReconnect) {
+      logger.debug('Auto-reconnect disabled, not scheduling reconnect')
+      return
+    }
 
-export async function getTranscriptionLogContent(sessionId: string): Promise<TranscriptionLogContent> {
-  const response = await fetchWithRetry(`${config.apiUrl}/transcription-logs/${sessionId}`, {
-    method: 'GET',
-  })
+    this.reconnectAttempts++
+    const delay = Math.min(this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1), 30000) // Max 30 seconds
+    
+    logger.info('Scheduling WebSocket reconnection', {
+      attempt: this.reconnectAttempts,
+      maxAttempts: this.maxReconnectAttempts,
+      delayMs: delay,
+      reason
+    })
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Failed to fetch transcription log: ${response.status} ${errorText}`)
+    this.reconnectTimeout = window.setTimeout(() => {
+      this.reconnectTimeout = null
+      // Only reconnect if we should and we're not already connected
+      if (this.shouldAutoReconnect && !this.isConnected()) {
+        logger.info('Attempting WebSocket reconnection', {
+          attempt: this.reconnectAttempts,
+          maxAttempts: this.maxReconnectAttempts
+        })
+        this.connect().catch((err) => {
+          logger.error('Reconnection attempt failed', err)
+          // Will schedule another reconnect in onclose if needed
+        })
+      }
+    }, delay)
   }
 
-  return response.json()
-}
+  sendAudioChunk(chunk: Blob): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      logger.warn('WebSocket not connected, cannot send audio chunk - will auto-reconnect', {
+        readyState: this.ws?.readyState,
+        isConnected: this.isConnected()
+      })
+      // If auto-reconnect is enabled and we're not connected, try to reconnect
+      if (this.shouldAutoReconnect && !this.isConnected() && !this.connectionPromise) {
+        logger.info('Attempting to reconnect WebSocket for audio chunk')
+        this.connect().catch((err) => {
+          logger.warn('Failed to reconnect for audio chunk', err)
+          // Auto-reconnect will continue trying
+        })
+      }
+      return
+    }
 
-export async function downloadAudioFile(filename: string): Promise<Blob> {
-  const response = await fetchWithRetry(`${config.apiUrl}/recordings/${filename}`, {
-    method: 'GET',
-  })
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Failed to download audio: ${response.status} ${errorText}`)
+    // Convert blob to base64
+    const reader = new FileReader()
+    reader.onloadend = () => {
+      if (reader.result && typeof reader.result === 'string') {
+        const base64 = reader.result.split(',')[1] // Remove data:audio/webm;base64, prefix
+        try {
+          this.ws?.send(JSON.stringify({
+            type: 'audio_chunk',
+            data: base64,
+          }))
+        } catch (err) {
+          logger.error('Failed to send audio chunk', err)
+          // If send fails, try to reconnect
+          if (this.shouldAutoReconnect && !this.connectionPromise) {
+            this.scheduleReconnect('Send failed')
+          }
+        }
+      }
+    }
+    reader.readAsDataURL(chunk)
   }
 
-  return response.blob()
+  sendSegmentEnd(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      logger.warn('WebSocket not connected, cannot send segment end - will auto-reconnect', {
+        readyState: this.ws?.readyState,
+        isConnected: this.isConnected()
+      })
+      // If auto-reconnect is enabled and we're not connected, try to reconnect
+      if (this.shouldAutoReconnect && !this.isConnected() && !this.connectionPromise) {
+        logger.info('Attempting to reconnect WebSocket for segment end')
+        this.connect().catch((err) => {
+          logger.warn('Failed to reconnect for segment end', err)
+          // Auto-reconnect will continue trying
+        })
+      }
+      return
+    }
+
+    try {
+      this.ws.send(JSON.stringify({
+        type: 'segment_end',
+      }))
+    } catch (err) {
+      logger.error('Failed to send segment end', err)
+      // If send fails, try to reconnect
+      if (this.shouldAutoReconnect && !this.connectionPromise) {
+        this.scheduleReconnect('Send segment_end failed')
+      }
+    }
+  }
+
+  disconnect(): void {
+    logger.info('Disconnecting WebSocket intentionally')
+    this.isIntentionallyDisconnected = true
+    this.shouldAutoReconnect = false
+    
+    // Clear any pending reconnection
+    if (this.reconnectTimeout !== null) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
+    
+    if (this.ws) {
+      try {
+        this.ws.close(1000, 'Intentional disconnect') // Normal closure code
+      } catch (err) {
+        logger.warn('Error closing WebSocket', err)
+      }
+      this.ws = null
+    }
+    
+    this.connectionPromise = null
+    this.reconnectAttempts = 0
+  }
+
+  enableAutoReconnect(): void {
+    logger.info('Enabling WebSocket auto-reconnect')
+    this.shouldAutoReconnect = true
+  }
+
+  disableAutoReconnect(): void {
+    logger.info('Disabling WebSocket auto-reconnect')
+    this.shouldAutoReconnect = false
+    if (this.reconnectTimeout !== null) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
+  }
+
+  isConnected(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN
+  }
+
+  getReconnectAttempts(): number {
+    return this.reconnectAttempts
+  }
+
+  resetReconnectState(): void {
+    logger.info('Resetting WebSocket reconnect state')
+    this.reconnectAttempts = 0
+    this.reconnectDelay = 2000
+    if (this.reconnectTimeout !== null) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
+  }
 }
 

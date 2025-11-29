@@ -1,0 +1,12 @@
+# Bad Words List
+# One word per line (case-insensitive)
+# This file is used for content guardrails
+
+fuck
+shit
+damn
+bitch
+asshole
+bastard
+# Add more as needed
+

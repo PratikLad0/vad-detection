@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { logger } from './utils/logger'
+import { AudioWebSocket } from './utils/api'
 import { config } from './config'
-import { uploadFile, sendTranscriptionText, getRecordings, getTranscriptionLogs, getTranscriptionLogContent, downloadAudioFile, type Recording, type TranscriptionLog, type TranscriptionLogContent } from './utils/api'
 
-type RecorderState = 'idle' | 'listening' | 'recording' | 'uploading' | 'done' | 'error'
+type RecorderState = 'idle' | 'listening' | 'recording' | 'done' | 'error'
 type VadClass = 'silence' | 'noise' | 'speech'
 
 type SpeechSegment = {
@@ -12,7 +12,7 @@ type SpeechSegment = {
   duration: number
 }
 
-type LogSource = 'system' | 'wake' | 'vad' | 'upload'
+type LogSource = 'system' | 'wake' | 'vad'
 type LogEntry = {
   id: number
   timestamp: string
@@ -28,27 +28,29 @@ function App() {
   const [statusText, setStatusText] = useState(
     'Checking microphone permission...',
   )
-  const [lastFilename, setLastFilename] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [segments, setSegments] = useState<SpeechSegment[]>([])
   const [logs, setLogs] = useState<LogEntry[]>([])
-  const [transcription, setTranscription] = useState<string>('')
-  const [completeTranscription, setCompleteTranscription] = useState<string>('') // Accumulated transcription
+  // VAD sensitivity tuning
+  const [vadSensitivity, setVadSensitivity] = useState<number>(0.5) // 0.0 to 1.0
+  const vadSensitivityRef = useRef<number>(0.5)
   const [showLogs, setShowLogs] = useState<boolean>(true)
-  const [saveTextFile, setSaveTextFile] = useState<boolean>(false)
-  const saveTextFileRef = useRef<boolean>(false)
   const [sessionId, setSessionId] = useState<string>('')
   const sessionIdRef = useRef<string>('')
+  // Chatbot state
+  type ChatMessage = {
+    id: string
+    type: 'user' | 'assistant'
+    content: string
+    timestamp: Date
+    backend?: string
+    error?: string | undefined
+  }
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [isProcessing, setIsProcessing] = useState<boolean>(false)
   const [isTTSPlaying, setIsTTSPlaying] = useState<boolean>(false)
-  const [isAudioPlaying, setIsAudioPlaying] = useState<boolean>(false)
-  const [lastAudioBlob, setLastAudioBlob] = useState<Blob | null>(null)
-  const [recordings, setRecordings] = useState<Recording[]>([])
-  const [transcriptionLogs, setTranscriptionLogs] = useState<TranscriptionLog[]>([])
-  const [loadingRecordings, setLoadingRecordings] = useState<boolean>(false)
-  const [loadingLogs, setLoadingLogs] = useState<boolean>(false)
-  const [viewingLogContent, setViewingLogContent] = useState<TranscriptionLogContent | null>(null)
-  const [loadingLogContent, setLoadingLogContent] = useState<boolean>(false)
-  const [playingRecording, setPlayingRecording] = useState<string | null>(null)
+  const currentQuestionRef = useRef<string>('')
+  const pendingUserMessageRef = useRef<string | null>(null)
 
   // Live VAD / energy monitor
   const [vadClass, setVadClass] = useState<VadClass>('silence')
@@ -66,6 +68,7 @@ function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
+  const gainNodeRef = useRef<GainNode | null>(null)
   const rafIdRef = useRef<number | null>(null)
   const chunksRef = useRef<Blob[]>([])
 
@@ -82,12 +85,9 @@ function App() {
   const wakeWordStoppedPromiseRef = useRef<Promise<void> | null>(null)
   const wakeWordStoppedResolverRef = useRef<(() => void) | null>(null)
   const wakeWordIntentionallyStoppedRef = useRef<boolean>(false)
-  // SpeechRecognition state tracking
+  // SpeechRecognition state tracking (for wake word only)
   const recognitionRunningRef = useRef(false)
   const recognitionRetryTimeoutRef = useRef<number | null>(null)
-  const transcriptionRestartTimeoutRef = useRef<number | null>(null)
-  const transcriptionRestartCountRef = useRef<number>(0)
-  const isTranscriptionStartingRef = useRef<boolean>(false)
   // Narrow SpeechRecognition types with minimal surface to avoid any
   type MinimalRecognition = {
     continuous: boolean
@@ -101,13 +101,12 @@ function App() {
     onresult: ((event: { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null
   } | null
   const recognitionRef = useRef<MinimalRecognition>(null)
-  const transcriptionRecognitionRef = useRef<MinimalRecognition>(null)
-  const transcriptionRef = useRef<string>('')
+  const currentAudioChunksRef = useRef<Blob[]>([])
+  const audioWebSocketRef = useRef<AudioWebSocket | null>(null)
   const ttsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
-  const lastAudioBlobRef = useRef<Blob | null>(null)
-  const audioPlayerRef = useRef<HTMLAudioElement | null>(null)
-  const isAudioPlayingRef = useRef<boolean>(false)
   const isTTSPlayingRef = useRef<boolean>(false)
+  const chatMessagesEndRef = useRef<HTMLDivElement | null>(null)
+  const chatContainerRef = useRef<HTMLDivElement | null>(null)
 
   const addLog = (source: LogSource, message: string, meta?: string) => {
     setLogs((prev) => {
@@ -135,8 +134,6 @@ function App() {
     setError(null)
     setSegments([])
     setLogs([])
-    setTranscription('')
-    transcriptionRef.current = ''
     setVadClass('silence')
     setEnergyLevel(0)
     setWakeMode(false)
@@ -158,13 +155,7 @@ function App() {
       clearTimeout(recognitionRetryTimeoutRef.current)
       recognitionRetryTimeoutRef.current = null
     }
-    // Stop transcription recognition
-    try {
-      transcriptionRecognitionRef.current?.stop()
-    } catch {
-      // ignore
-    }
-    transcriptionRecognitionRef.current = null
+    currentAudioChunksRef.current = []
   }
 
   const cleanup = () => {
@@ -175,6 +166,9 @@ function App() {
 
     analyserRef.current?.disconnect()
     analyserRef.current = null
+
+    gainNodeRef.current?.disconnect()
+    gainNodeRef.current = null
 
     audioContextRef.current?.close()
     audioContextRef.current = null
@@ -203,25 +197,23 @@ function App() {
       clearTimeout(recognitionRetryTimeoutRef.current)
       recognitionRetryTimeoutRef.current = null
     }
-    // Stop transcription recognition
-    try {
-      transcriptionRecognitionRef.current?.stop()
-    } catch {
-      // ignore
+    // WebSocket cleanup - disable auto-reconnect and disconnect
+    if (audioWebSocketRef.current) {
+      audioWebSocketRef.current.disableAutoReconnect()
+      audioWebSocketRef.current.disconnect()
+      audioWebSocketRef.current = null
     }
-    transcriptionRecognitionRef.current = null
-    // Don't clear transcription - keep it visible after recording completes
   }
-
-  // Sync saveTextFileRef with saveTextFile state
-  useEffect(() => {
-    saveTextFileRef.current = saveTextFile
-  }, [saveTextFile])
 
   // Sync sessionIdRef with sessionId state
   useEffect(() => {
     sessionIdRef.current = sessionId
   }, [sessionId])
+
+  // Sync vadSensitivityRef with vadSensitivity state
+  useEffect(() => {
+    vadSensitivityRef.current = vadSensitivity
+  }, [vadSensitivity])
 
   // Generate session ID immediately on component mount (before any other effects)
   // This ensures sessionId is available from the start
@@ -238,6 +230,13 @@ function App() {
     logger.info('Session ID generated on page load', { sessionId: newSessionId })
     console.log('🟢 Session ID generated on page load:', newSessionId)
   }, []) // Empty dependency array - only run once on mount
+
+  // Auto-scroll chat to bottom when new messages arrive (ChatGPT style)
+  useEffect(() => {
+    if (chatMessagesEndRef.current) {
+      chatMessagesEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [chatMessages, isProcessing])
 
   useEffect(() => {
     const checkPermissionAndMaybeStart = async () => {
@@ -285,49 +284,12 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Fetch recordings and logs when Event Log is opened, and also on component mount
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        setLoadingRecordings(true)
-        const recordingsData = await getRecordings()
-        setRecordings(recordingsData)
-      } catch (err) {
-        logger.error('Failed to fetch recordings', err)
-      } finally {
-        setLoadingRecordings(false)
-      }
-
-      if (showLogs) {
-        try {
-          setLoadingLogs(true)
-          const logsData = await getTranscriptionLogs()
-          setTranscriptionLogs(logsData)
-        } catch (err) {
-          logger.error('Failed to fetch transcription logs', err)
-        } finally {
-          setLoadingLogs(false)
-        }
-      }
-    }
-
-    fetchData()
-    
-    // Refresh recordings periodically (every 30 seconds)
-    const interval = setInterval(() => {
-      getRecordings()
-        .then(setRecordings)
-        .catch((err) => logger.error('Failed to refresh recordings', err))
-    }, 30000)
-
-    return () => clearInterval(interval)
-  }, [showLogs])
+  // No longer fetching recordings or logs - removed saving functionality
 
   // Start wake-word mode (one-time permission + continuous standby)
   const startWakeWordMode = async () => {
     try {
       setError(null)
-      setLastFilename(null)
       setSegments([])
       setWakeMode(true)
       wakeModeRef.current = true
@@ -345,81 +307,233 @@ function App() {
       audioContextRef.current = audioContext
 
       const source = audioContext.createMediaStreamSource(stream)
+      
+      // Connect source to analyser for VAD only (no speaker feedback)
       const analyser = audioContext.createAnalyser()
       analyser.fftSize = 2048
       analyserRef.current = analyser
       source.connect(analyser)
+      
+      // Do NOT connect to destination - we don't want to hear our own voice
 
       const mediaRecorder = new MediaRecorder(stream)
       mediaRecorderRef.current = mediaRecorder
 
       chunksRef.current = []
+      
+      // Initialize WebSocket for chatbot responses ONCE (not in the VAD loop)
+      if (!audioWebSocketRef.current && sessionIdRef.current) {
+        logger.info('Initializing WebSocket for chatbot', { sessionId: sessionIdRef.current })
+        audioWebSocketRef.current = new AudioWebSocket(
+          sessionIdRef.current,
+          () => {}, // No transcription callback needed
+          (response) => {
+            // Handle chatbot response - ChatGPT style
+            logger.info('Chatbot response callback triggered', { 
+              hasResponse: !!response.response,
+              hasError: !!response.error,
+              hasTranscription: !!response.transcription,
+              currentQuestionId: currentQuestionRef.current
+            })
+            
+            setIsProcessing(false)
+            
+            // Update user message with actual transcription (ChatGPT shows user message immediately)
+            // This ensures the transcription is always visible in chat history
+            if (response.transcription) {
+              if (currentQuestionRef.current) {
+                logger.info('Updating user message with transcription', {
+                  questionId: currentQuestionRef.current,
+                  transcription: response.transcription.substring(0, 50)
+                })
+                setChatMessages((prev) => {
+                  const updated = prev.map(msg => 
+                    msg.id === currentQuestionRef.current && msg.type === 'user'
+                      ? { ...msg, content: response.transcription! }
+                      : msg
+                  )
+                  // Log if message was found and updated
+                  const found = updated.find(msg => msg.id === currentQuestionRef.current)
+                  if (found && found.content === response.transcription) {
+                    logger.info('User message successfully updated with transcription')
+                  } else {
+                    logger.warn('User message not found or not updated, adding new message', {
+                      questionId: currentQuestionRef.current,
+                      messagesInState: prev.map(m => ({ id: m.id, type: m.type }))
+                    })
+                    // If message not found, add it as a new user message
+                    if (response.transcription) {
+                      return [
+                        ...updated,
+                        {
+                          id: currentQuestionRef.current,
+                          type: 'user' as const,
+                          content: response.transcription,
+                          timestamp: new Date()
+                        }
+                      ]
+                    }
+                  }
+                  return updated
+                })
+                pendingUserMessageRef.current = null
+              } else {
+                // No current question ID, but we have transcription - add it as a new message
+                const transcription = response.transcription
+                if (transcription) {
+                  logger.info('Adding transcription as new user message (no current question ID)', {
+                    transcription: transcription.substring(0, 50)
+                  })
+                  setChatMessages((prev) => [
+                    ...prev,
+                    {
+                      id: `user-${Date.now()}`,
+                      type: 'user',
+                      content: transcription,
+                      timestamp: new Date()
+                    }
+                  ])
+                }
+              }
+            } else if (!response.transcription && currentQuestionRef.current) {
+              logger.warn('No transcription received in chatbot response', {
+                questionId: currentQuestionRef.current,
+                hasResponse: !!response.response,
+                hasError: !!response.error
+              })
+              // Keep the placeholder but mark it as transcribed (even without text)
+              setChatMessages((prev) => prev.map(msg => 
+                msg.id === currentQuestionRef.current && msg.type === 'user' && msg.content === '🎤 [Transcribing...]'
+                  ? { ...msg, content: '🎤 [Audio recorded - transcription unavailable]' }
+                  : msg
+              ))
+            }
+            
+            if (response.error) {
+              logger.warn('Chatbot error', response.error)
+              // Add error message as assistant message
+              setChatMessages((prev) => [
+                ...prev,
+                {
+                  id: `error-${Date.now()}`,
+                  type: 'assistant',
+                  content: `Error: ${response.error}`,
+                  timestamp: new Date(),
+                  error: response.error || undefined
+                }
+              ])
+            } else if (response.response) {
+              logger.info('Chatbot response received', { 
+                response: response.response.substring(0, 50),
+                backend: response.backend_used
+              })
+              
+              // Add assistant response (ChatGPT style - appears after user message)
+              setChatMessages((prev) => [
+                ...prev,
+                {
+                  id: `assistant-${Date.now()}`,
+                  type: 'assistant',
+                  content: response.response!,
+                  timestamp: new Date(),
+                  backend: response.backend_used
+                }
+              ])
+              
+              addLog('system', 'Chatbot response received', response.response.substring(0, 50))
+              
+              // Play TTS response
+              playTTS(response.response)
+            } else {
+              logger.warn('Chatbot response has no response or error')
+            }
+          },
+          (error: Error) => {
+            logger.error('WebSocket error', error)
+            setIsProcessing(false)
+            // Remove pending user message if WebSocket fails
+            if (currentQuestionRef.current) {
+              setChatMessages((prev) => prev.filter(msg => msg.id !== currentQuestionRef.current))
+            }
+            pendingUserMessageRef.current = null
+            setError(`WebSocket error: ${error.message}`)
+          }
+        )
+        
+        // Check backend health before connecting WebSocket
+        const checkBackendHealth = async () => {
+          try {
+            const healthUrl = `${config.apiUrl}/health`
+            logger.info('Checking backend health', { url: healthUrl })
+            const response = await fetch(healthUrl, { 
+              method: 'GET',
+              signal: AbortSignal.timeout(5000) // 5 second timeout
+            })
+            if (response.ok) {
+              const health = await response.json()
+              logger.info('Backend health check passed', health)
+              return true
+            } else {
+              logger.warn('Backend health check failed', { status: response.status })
+              return false
+            }
+          } catch (err) {
+            logger.error('Backend health check error', err)
+            return false
+          }
+        }
+        
+        // Connect WebSocket after health check
+        checkBackendHealth().then((isHealthy) => {
+          if (!isHealthy) {
+            setIsProcessing(false)
+            if (currentQuestionRef.current) {
+              setChatMessages((prev) => prev.filter(msg => msg.id !== currentQuestionRef.current))
+            }
+            pendingUserMessageRef.current = null
+            setError(`Backend server is not accessible at ${config.apiUrl}. Please ensure the backend is running.`)
+            return
+          }
+          
+          // Backend is healthy, enable auto-reconnect and try to connect WebSocket
+          if (audioWebSocketRef.current) {
+            audioWebSocketRef.current.enableAutoReconnect()
+            audioWebSocketRef.current.connect().catch((err) => {
+              logger.error('Failed to connect WebSocket (will auto-retry)', err)
+              // Don't set error immediately - let auto-reconnect handle it
+              // Only show error if max attempts reached (handled in onError callback)
+            })
+          }
+        })
+      }
+      
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
+          // CRITICAL: Don't send audio chunks while TTS is playing (prevents feedback loop)
+          if (isTTSPlayingRef.current) {
+            logger.debug('Skipping audio chunk - TTS is playing')
+            return
+          }
+          
           chunksRef.current.push(event.data)
+          // Send audio chunk to WebSocket for chatbot processing
+          if (audioWebSocketRef.current && audioWebSocketRef.current.isConnected()) {
+            audioWebSocketRef.current.sendAudioChunk(event.data)
+          } else {
+            logger.warn('WebSocket not connected, cannot send audio chunk')
+          }
         }
       }
       mediaRecorder.onstop = async () => {
         const currentSessionId = sessionIdRef.current || sessionId
         logger.info('MediaRecorder stopped', { 
           chunksCount: chunksRef.current.length,
-          saveTextFile: saveTextFileRef.current,
-          sessionId: currentSessionId,
-          sessionIdFromRef: sessionIdRef.current,
-          sessionIdFromState: sessionId
-        })
-        console.log('🔵 MediaRecorder stopped', {
-          sessionId: currentSessionId,
-          saveTextFile: saveTextFileRef.current
-        })
-        
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-        chunksRef.current = []
-        
-        // Only store audio blob if not in text-only mode
-        if (!saveTextFileRef.current) {
-          setLastAudioBlob(blob)
-          lastAudioBlobRef.current = blob
-        } else {
-          // Clear audio blob in text-only mode
-          setLastAudioBlob(null)
-          lastAudioBlobRef.current = null
-        }
-        
-        // Save the final transcription from this recording session to complete transcription
-        // This preserves all transcriptions across multiple recording sessions
-        const currentTranscription = transcriptionRef.current || transcription
-        logger.info('MediaRecorder onstop - transcription state', {
-          transcriptionRef: transcriptionRef.current?.substring(0, 50),
-          transcriptionState: transcription.substring(0, 50),
-          hasTranscription: !!currentTranscription.trim(),
           sessionId: currentSessionId
         })
         
-        // Add this recording's transcription to the accumulated complete transcription
-        // The real-time transcription field will be cleared on the next recording start
-        if (currentTranscription.trim()) {
-          setCompleteTranscription(prev => {
-            const newText = prev ? `${prev}\n\n${currentTranscription}` : currentTranscription
-            return newText
-          })
-        }
+        // Clear chunks - no longer saving audio
+        chunksRef.current = []
         
-        logger.info('Calling uploadRecording', { 
-          blobSize: blob.size,
-          saveTextFile: saveTextFileRef.current,
-          sessionId: currentSessionId,
-          sessionIdFromRef: sessionIdRef.current,
-          sessionIdFromState: sessionId,
-          hasTranscription: !!currentTranscription.trim()
-        })
-        console.log('🔵 Calling uploadRecording with sessionId:', currentSessionId)
-        await uploadRecording(blob)
-        
-        // Play TTS after upload completes
-        if (currentTranscription.trim()) {
-          playTTS(currentTranscription)
-        }
         
         // In wake mode, remain active and wait for next wake trigger
         speakingRef.current = false
@@ -438,11 +552,15 @@ function App() {
         }
       }
 
-      // Thresholds
-      const SILENCE_DURATION_MS = 1500
-      const SILENCE_RMS = 0.005
-      const SPEECH_RMS = 0.03
+      // Thresholds - adjusted by VAD sensitivity (0.0 = most sensitive, 1.0 = least sensitive)
+      const BASE_SILENCE_RMS = 0.005
+      const BASE_SPEECH_RMS = 0.03
+      const sensitivity = vadSensitivityRef.current
+      // Lower sensitivity = lower thresholds (more sensitive)
+      const SILENCE_RMS = BASE_SILENCE_RMS * (1 + sensitivity)
+      const SPEECH_RMS = BASE_SPEECH_RMS * (1 + sensitivity * 2)
       const VOICE_THRESHOLD = SPEECH_RMS
+      const SILENCE_DURATION_MS = 300 // Ultra-fast response: 300ms silence threshold
 
       const data = new Float32Array(analyser.fftSize)
 
@@ -480,16 +598,25 @@ function App() {
           return
         }
 
+        // Don't record while TTS is playing (prevent feedback loop)
+        // BUT allow user barge-in: if user speaks during TTS, stop TTS and start recording
+        if (isTTSPlayingRef.current) {
+          // User barge-in: if user speaks loudly during TTS, interrupt TTS and start recording
+          if (rms > VOICE_THRESHOLD * 1.5) { // Higher threshold for barge-in (user must speak louder)
+            logger.info('User barge-in detected during TTS - stopping TTS and starting recording')
+            stopTTS()
+            // Fall through to start recording
+          } else {
+            // TTS is playing and no user barge-in - skip recording
+            rafIdRef.current = requestAnimationFrame(loop)
+            return
+          }
+        }
+
         if (rms > VOICE_THRESHOLD) {
           lastSpeechTimeRef.current = now
+          
           if (!speakingRef.current) {
-            // Completely ignore speech when TTS/audio is playing - no barge-in, no recording
-            if (isTTSPlayingRef.current || isAudioPlayingRef.current) {
-              // Ignore all speech while TTS/audio is playing to prevent microphone picking up speaker audio
-              rafIdRef.current = requestAnimationFrame(loop)
-              return
-            }
-            
             speakingRef.current = true
             currentSpeechStartRef.current = now
             setStatusText('Speech detected, recording...')
@@ -497,99 +624,80 @@ function App() {
             addLog('vad', 'Speech detected, starting recording')
             
             if (mediaRecorder.state !== 'recording') {
-              // Only clear transcription if this is a new speech session (wake word just detected)
-              // Don't clear if MediaRecorder is restarting due to silence/TTS
-              const isNewSpeechSession = !transcriptionRef.current || transcriptionRef.current.length === 0
+              currentAudioChunksRef.current = []
               
-              if (isNewSpeechSession) {
-                // New speech session - clear transcription
-                setTranscription('')
-                transcriptionRef.current = ''
-                logger.info('Starting MediaRecorder - new speech session, transcription cleared', { 
-                  saveTextFile: saveTextFileRef.current,
-                  sessionId
-                })
-                console.log('🟢 Starting new recording - new speech session, transcription cleared', {
-                  textOnlyMode: saveTextFileRef.current,
-                  note: 'MediaRecorder works in both modes - needed for transcription'
-                })
-              } else {
-                // Continuing existing speech session - keep transcription
-                logger.info('Starting MediaRecorder - continuing speech session, transcription preserved', { 
-                  saveTextFile: saveTextFileRef.current,
-                  sessionId,
-                  existingTranscriptionLength: transcriptionRef.current.length
-                })
-                console.log('🟢 Starting new recording - continuing speech session, transcription preserved', {
-                  textOnlyMode: saveTextFileRef.current,
-                  existingTranscriptionLength: transcriptionRef.current.length,
-                  note: 'MediaRecorder works in both modes - needed for transcription'
-                })
+              // Ensure WebSocket is connected before starting recording
+              if (!audioWebSocketRef.current) {
+                logger.warn('WebSocket not initialized, cannot start recording')
+                return
               }
+              
+              if (!audioWebSocketRef.current.isConnected()) {
+                logger.warn('WebSocket not connected, attempting to connect...')
+                // Try to connect with retry (non-blocking)
+                const attemptConnection = async (retries = 3) => {
+                  for (let i = 0; i < retries; i++) {
+                    try {
+                      await audioWebSocketRef.current!.connect()
+                      logger.info('WebSocket connected successfully')
+                      return true
+                    } catch (err) {
+                      logger.warn(`WebSocket connection attempt ${i + 1}/${retries} failed`, err)
+                      if (i < retries - 1) {
+                        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))) // Exponential backoff
+                      }
+                    }
+                  }
+                  return false
+                }
+                
+                // Don't await - let it connect in background
+                attemptConnection().then((connected) => {
+                  if (!connected) {
+                    logger.error('Failed to connect WebSocket after retries')
+                    setIsProcessing(false)
+                    if (pendingUserMessageRef.current) {
+                      setChatMessages((prev) => prev.filter(msg => msg.id !== pendingUserMessageRef.current))
+                      pendingUserMessageRef.current = null
+                    }
+                    setError(`Failed to connect to chatbot service. Please ensure the backend is running at ${config.apiUrl}`)
+                  }
+                }).catch((err) => {
+                  logger.error('Connection attempt error', err)
+                  setIsProcessing(false)
+                  if (pendingUserMessageRef.current) {
+                    setChatMessages((prev) => prev.filter(msg => msg.id !== pendingUserMessageRef.current))
+                    pendingUserMessageRef.current = null
+                  }
+                  setError(`Failed to connect to chatbot service: ${err instanceof Error ? err.message : 'Unknown error'}`)
+                })
+                // Don't wait for connection - continue and let it connect in background
+                // The recording will wait for connection before sending chunks
+                return
+              }
+              
               try {
                 mediaRecorder.start()
-                console.log('✅ MediaRecorder.start() called', {
-                  state: mediaRecorder.state,
-                  timestamp: new Date().toISOString()
-                })
-                // Verify MediaRecorder actually started
-                setTimeout(() => {
-                  console.log('🔍 MediaRecorder state check after start', {
-                    state: mediaRecorder.state,
-                    expectedState: 'recording',
-                    isRecording: mediaRecorder.state === 'recording'
-                  })
-                }, 50)
+                logger.info('MediaRecorder started', { sessionId: sessionIdRef.current })
               } catch (err) {
                 console.error('❌ Failed to start MediaRecorder', err)
                 logger.error('Failed to start MediaRecorder', err)
                 return
               }
-              
-              console.log('🟢 MediaRecorder started, starting transcription in 1000ms...', {
-                textOnlyMode: saveTextFileRef.current,
-                note: 'MediaRecorder works in both modes - needed for transcription. Longer delay to ensure wake word recognition is fully stopped.'
-              })
-              // Start transcription - add longer delay to ensure wake word recognition is fully stopped
-              // and MediaRecorder is ready. The browser needs time to release SpeechRecognition service.
-              // NOTE: MediaRecorder must stay active in text-only mode for transcription to work
-              // Use the local mediaRecorder variable (not ref) since we know it's recording
-              setTimeout(() => {
-                const currentState = mediaRecorder.state
-                const mediaRecorderFromRef = mediaRecorderRef.current
-                console.log('🟢 Calling startTranscription() after delay', {
-                  mediaRecorderState: currentState,
-                  mediaRecorderFromRefState: mediaRecorderFromRef?.state,
-                  isRecording: currentState === 'recording',
-                  speakingRef: speakingRef.current,
-                  textOnlyMode: saveTextFileRef.current,
-                  usingLocalMediaRecorder: true
-                })
-                // MediaRecorder must be recording for transcription to work (in both normal and text-only mode)
-                // Use the local mediaRecorder variable which we know is recording
-                if (currentState === 'recording') {
-                  // Pass the mediaRecorder state to startTranscription to avoid ref timing issues
-                  startTranscription(mediaRecorder)
-                } else {
-                  console.error('❌ Cannot start transcription - MediaRecorder not recording', {
-                    state: currentState,
-                    refState: mediaRecorderFromRef?.state,
-                    speakingRef: speakingRef.current,
-                    textOnlyMode: saveTextFileRef.current,
-                    note: 'MediaRecorder should be recording in both modes for transcription'
-                  })
-                  logger.error('Cannot start transcription - MediaRecorder not recording', {
-                    state: currentState,
-                    refState: mediaRecorderFromRef?.state
-                  })
-                  setError('MediaRecorder stopped unexpectedly. Cannot start transcription.')
-                }
-              }, 1000) // Increased delay to ensure wake word recognition is fully stopped
             }
           }
         } else if (speakingRef.current) {
-          // Don't process silence/stop recording if TTS is playing
-          if (isTTSPlayingRef.current || isAudioPlayingRef.current) {
+          // If TTS started while we were recording, stop immediately
+          if (isTTSPlayingRef.current) {
+            logger.info('TTS started during recording - stopping recording immediately')
+            speakingRef.current = false
+            if (mediaRecorder.state === 'recording') {
+              try {
+                mediaRecorder.stop()
+              } catch (err) {
+                logger.warn('Error stopping MediaRecorder when TTS started', err)
+              }
+            }
             rafIdRef.current = requestAnimationFrame(loop)
             return
           }
@@ -628,39 +736,65 @@ function App() {
             ])
             addLog('vad', 'Speech ended, stopping recording', `Duration ${durationSec.toFixed(2)}s`)
 
-            setStatusText('Silence detected, stopping...')
+            setStatusText('Silence detected, processing question...')
             if (mediaRecorder.state === 'recording') {
-              logger.info('Stopping recording due to silence', {
-                saveTextFile: saveTextFileRef.current,
-                currentTranscription: transcriptionRef.current?.substring(0, 50),
-                sessionId
-              })
-              // Stop transcription and wait for final results before stopping recorder
-              stopTranscription().then(() => {
-                // Additional delay to ensure transcription is fully processed
-                setTimeout(() => {
-                  if (mediaRecorder.state === 'recording') {
-                    logger.info('Stopping MediaRecorder', { sessionId })
-                    mediaRecorder.stop()
-                  } else {
-                    logger.warn('MediaRecorder not in recording state when trying to stop', {
-                      state: mediaRecorder.state,
-                      sessionId
-                    })
-                  }
-                }, 300)
-              }).catch((err) => {
-                logger.error('Error stopping transcription', err)
-                // Still try to stop the recorder even if transcription stop failed
-                if (mediaRecorder.state === 'recording') {
-                  mediaRecorder.stop()
+              logger.info('Stopping recording due to silence', { sessionId })
+              
+              // ChatGPT style: Add user message immediately with placeholder
+              // Will be updated with actual transcription when received
+              const questionId = `user-${Date.now()}`
+              currentQuestionRef.current = questionId
+              setIsProcessing(true)
+              
+              // Add user message (ChatGPT shows user message immediately)
+              setChatMessages((prev) => [
+                ...prev,
+                {
+                  id: questionId,
+                  type: 'user',
+                  content: '🎤 [Transcribing...]',
+                  timestamp: new Date()
                 }
-              })
+              ])
+              pendingUserMessageRef.current = questionId
+              
+              // Send segment end to trigger chatbot response
+              if (audioWebSocketRef.current && audioWebSocketRef.current.isConnected()) {
+                logger.info('Sending segment_end to trigger chatbot response')
+                audioWebSocketRef.current.sendSegmentEnd()
+              } else {
+                logger.error('WebSocket not connected, cannot send segment_end')
+                setIsProcessing(false)
+                // Remove the user message we just added
+                setChatMessages((prev) => prev.filter(msg => msg.id !== questionId))
+                pendingUserMessageRef.current = null
+                setError('WebSocket not connected')
+              }
+              
+              // Stop MediaRecorder
+              setTimeout(() => {
+                if (mediaRecorder.state === 'recording' && !isTTSPlayingRef.current) {
+                  logger.info('Stopping MediaRecorder', { sessionId })
+                  try {
+                    mediaRecorder.stop()
+                  } catch (err) {
+                    logger.warn('Error stopping MediaRecorder', err)
+                  }
+                } else if (isTTSPlayingRef.current) {
+                  logger.info('TTS started - MediaRecorder will be stopped by TTS handler')
+                }
+              }, 300)
             } else {
               logger.warn('MediaRecorder not recording when silence detected', {
                 state: mediaRecorder.state,
                 sessionId
               })
+              // Still clear processing state if we were processing
+              setIsProcessing(false)
+              if (pendingUserMessageRef.current) {
+                setChatMessages((prev) => prev.filter(msg => msg.id !== pendingUserMessageRef.current))
+                pendingUserMessageRef.current = null
+              }
             }
             // In wake mode, do NOT cleanup; keep listening
             if (!wakeModeRef.current) {
@@ -936,11 +1070,6 @@ function App() {
             setWakeStatus('triggered')
             setStatusText('Wake word "Hey AI" detected. Speak your message...')
             addLog('wake', 'Wake word "Hey AI" detected, VAD armed', lower)
-            // Clear transcription for new speech session when wake word is detected
-            setTranscription('')
-            transcriptionRef.current = ''
-            logger.info('Wake word detected - transcription cleared for new speech session')
-            
             // Stop wake word recognition - transcription will start when speech is detected
             if (recognitionRef.current && recognitionRunningRef.current) {
               try {
@@ -986,435 +1115,11 @@ function App() {
     }
   }
 
-  const startTranscription = (mediaRecorderInstance?: MediaRecorder) => {
-    // Start real-time speech-to-text transcription
-    // This will convert the user's speech to text and display it in real-time
-    // The transcription accumulates as the user speaks until speech stops
-    // mediaRecorderInstance: Optional MediaRecorder instance to check state (avoids ref timing issues)
-    const mediaRecorder = mediaRecorderInstance || mediaRecorderRef.current
-    const currentState = mediaRecorder?.state || 'unknown'
-    console.log('🟢 startTranscription() called', {
-      mediaRecorderState: currentState,
-      mediaRecorderExists: !!mediaRecorder,
-      usingProvidedInstance: !!mediaRecorderInstance,
-      speakingRef: speakingRef.current,
-      wakeMode: wakeModeRef.current,
-      recognitionRunning: recognitionRunningRef.current,
-      hasExistingTranscription: !!transcriptionRecognitionRef.current,
-      timestamp: new Date().toISOString()
-    })
-    logger.info('startTranscription() called', {
-      mediaRecorderState: currentState,
-      usingProvidedInstance: !!mediaRecorderInstance,
-      speakingRef: speakingRef.current
-    })
-    
-    // Critical check: MediaRecorder must be recording for transcription to work
-    // In text-only mode, MediaRecorder still needs to be recording for transcription
-    if (!mediaRecorder || mediaRecorder.state !== 'recording') {
-      const errorMsg = `Cannot start transcription - MediaRecorder is not recording (state: ${currentState})`
-      console.error('❌', errorMsg, {
-        mediaRecorderExists: !!mediaRecorder,
-        state: currentState,
-        usingProvidedInstance: !!mediaRecorderInstance,
-        refState: mediaRecorderRef.current?.state
-      })
-      logger.error(errorMsg, {
-        mediaRecorderState: currentState,
-        mediaRecorderExists: !!mediaRecorder,
-        usingProvidedInstance: !!mediaRecorderInstance,
-        speakingRef: speakingRef.current
-      })
-      setError(errorMsg)
-      return
-    }
-    
-    // Check if SpeechRecognition is available
-    type SRCtor = new () => {
-      continuous: boolean
-      interimResults: boolean
-      lang: string
-      start: () => void
-      stop: () => void
-      onstart: (() => void) | null
-      onerror: ((e: unknown) => void) | null
-      onend: (() => void) | null
-      onresult: ((event: { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null
-    }
-    const SpeechRecognition =
-      (window as unknown as { SpeechRecognition?: SRCtor; webkitSpeechRecognition?: SRCtor })
-        .SpeechRecognition ||
-      (window as unknown as { SpeechRecognition?: SRCtor; webkitSpeechRecognition?: SRCtor })
-        .webkitSpeechRecognition
 
-    if (!SpeechRecognition) {
-      const errorMsg = 'Speech Recognition not supported in this browser. Please use Chrome, Edge, or Safari.'
-      console.error('❌', errorMsg)
-      logger.warn('Speech Recognition not supported in this browser')
-      addLog('system', 'Transcription not available - browser does not support Speech Recognition API')
-      setError(errorMsg)
-      setStatusText('Transcription not available - please use Chrome, Edge, or Safari browser')
-      return
-    }
-    
-    console.log('🟢 SpeechRecognition API found, creating instance')
-
-    // Stop any existing transcription
-    if (transcriptionRecognitionRef.current) {
-      try {
-        console.log('🟡 Stopping existing transcription instance')
-        transcriptionRecognitionRef.current.stop()
-        transcriptionRecognitionRef.current = null
-      } catch (err) {
-        console.warn('⚠️ Error stopping existing transcription', err)
-      }
-    }
-
-    try {
-      console.log('🟢 Creating new SpeechRecognition instance for transcription')
-      const transcriptionRecognition = new SpeechRecognition() as MinimalRecognition
-      if (!transcriptionRecognition) {
-        console.error('❌ Failed to create SpeechRecognition instance')
-        logger.error('Failed to create SpeechRecognition instance')
-        return
-      }
-      
-      console.log('🟢 Configuring transcription recognition', {
-        continuous: true,
-        interimResults: true,
-        lang: 'en-US'
-      })
-      transcriptionRecognitionRef.current = transcriptionRecognition
-      transcriptionRecognition.continuous = true
-      transcriptionRecognition.interimResults = true
-      transcriptionRecognition.lang = 'en-US'
-
-      transcriptionRecognition.onstart = () => {
-        console.log('✅ Transcription started successfully', {
-          sessionId,
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          speakingRef: speakingRef.current,
-          recognitionRunning: recognitionRunningRef.current,
-          timestamp: new Date().toISOString()
-        })
-        logger.info('Transcription started successfully', {
-          sessionId,
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          speakingRef: speakingRef.current
-        })
-        addLog('system', 'Transcription started - listening for speech...')
-        setStatusText('Transcription active - speak now...')
-        // Reset restart count on successful start
-        transcriptionRestartCountRef.current = 0
-        isTranscriptionStartingRef.current = false
-        
-        // Wake word recognition should already be stopped when wake word was detected
-        // But ensure it's stopped to avoid conflicts
-        if (recognitionRef.current && recognitionRunningRef.current) {
-          try {
-            console.log('🟡 Ensuring wake word recognition is stopped for transcription')
-            wakeWordIntentionallyStoppedRef.current = true // Prevent auto-restart
-            const wakeRecognition = recognitionRef.current
-            wakeRecognition.stop()
-            recognitionRunningRef.current = false
-            console.log('🟡 Wake word recognition stop() called in onstart handler')
-            // Don't wait here - just ensure it's stopped
-          } catch (err) {
-            console.warn('⚠️ Failed to stop wake word recognition', err)
-          }
-        } else {
-          console.log('✅ Wake word recognition already stopped (or not running)')
-        }
-      }
-
-      transcriptionRecognition.onresult = (event: {
-        resultIndex: number
-        results: ArrayLike<ArrayLike<{ transcript: string; isFinal?: boolean }>>
-      }) => {
-        console.log('📝 Transcription onresult event received', {
-          resultIndex: event.resultIndex,
-          resultsLength: event.results.length,
-          timestamp: new Date().toISOString()
-        })
-        
-        // Build full transcript from all results in this event
-        // SpeechRecognition API accumulates results, so this gives us the complete
-        // transcription from the start of this recording session
-        let fullTranscript = ''
-        let hasFinal = false
-        const transcripts: string[] = []
-        
-        for (let i = 0; i < event.results.length; i++) {
-          const result = event.results[i]
-          if (result && result.length > 0) {
-            const transcript = result[0]?.transcript || ''
-            const isFinal = result[0]?.isFinal || false
-            fullTranscript += transcript
-            transcripts.push(`${transcript}${isFinal ? ' [FINAL]' : ' [interim]'}`)
-            if (isFinal) {
-              hasFinal = true
-            }
-          }
-        }
-        
-        const newTranscript = fullTranscript.trim()
-        
-        console.log('📝 Transcription processed', {
-          fullTranscript: newTranscript,
-          length: newTranscript.length,
-          hasFinal,
-          resultCount: event.results.length,
-          transcripts: transcripts,
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          speakingRef: speakingRef.current
-        })
-        
-        // Update real-time transcription display
-        // This shows the live transcription as the user speaks, accumulating until speech stops
-        setTranscription(newTranscript)
-        transcriptionRef.current = newTranscript
-        
-        if (newTranscript) {
-          console.log('✅ Transcription updated in UI:', {
-            length: newTranscript.length,
-            preview: newTranscript.substring(0, 100),
-            isFinal: hasFinal
-          })
-          logger.info('Transcription updated', {
-            length: newTranscript.length,
-            preview: newTranscript.substring(0, 50),
-            isFinal: hasFinal,
-            resultCount: event.results.length
-          })
-        } else {
-          console.log('🟡 Transcription event received but transcript is empty', {
-            resultCount: event.results.length,
-            transcripts: transcripts
-          })
-        }
-        logger.info('Transcription updated', { 
-          length: newTranscript.length, 
-          preview: newTranscript.substring(0, 50),
-          isFinal: hasFinal,
-          resultCount: event.results.length,
-          hasContent: !!newTranscript
-        })
-      }
-
-      transcriptionRecognition.onerror = (e: unknown) => {
-        const errorEvent = e as { error?: string; message?: string } | null
-        const errorType = errorEvent?.error || 'unknown'
-        const errorMessage = errorEvent?.message || ''
-        
-        console.error('❌ Transcription error', {
-          errorType,
-          errorMessage,
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          speakingRef: speakingRef.current,
-          recognitionRunning: recognitionRunningRef.current,
-          transcriptionRestartCount: transcriptionRestartCountRef.current,
-          timestamp: new Date().toISOString()
-        })
-        logger.error('Transcription error', {
-          error: errorType,
-          message: errorMessage,
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          speakingRef: speakingRef.current
-        })
-        
-        // Ignore harmless errors
-        if (errorType === 'aborted' || errorType === 'no-speech') {
-          console.log('⚠️ Ignoring harmless transcription error:', errorType, {
-            context: {
-              mediaRecorderState: mediaRecorderRef.current?.state,
-              speakingRef: speakingRef.current,
-              timeSinceStart: Date.now()
-            }
-          })
-          return
-        }
-        
-        // Log and display important errors
-        logger.error('Transcription error', { error: errorType, message: errorMessage })
-        addLog('system', `Transcription error: ${errorType}`, errorMessage || undefined)
-        
-        // Show user-friendly error messages for common issues
-        if (errorType === 'not-allowed') {
-          setError('Microphone permission denied for transcription. Please allow microphone access.')
-          setStatusText('Microphone permission required for transcription')
-        } else if (errorType === 'network') {
-          setError('Network error during transcription. Please check your internet connection.')
-        } else if (errorType === 'service-not-allowed') {
-          setError('Speech recognition service not available. Please try again later.')
-        } else {
-          setError(`Transcription error: ${errorType}. ${errorMessage}`)
-        }
-      }
-
-      transcriptionRecognition.onend = () => {
-        console.log('🟡 Transcription ended', {
-          stillSpeaking: speakingRef.current,
-          isStarting: isTranscriptionStartingRef.current,
-          restartCount: transcriptionRestartCountRef.current,
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          recognitionRunning: recognitionRunningRef.current,
-          currentTranscription: transcriptionRef.current?.substring(0, 50),
-          timestamp: new Date().toISOString()
-        })
-        logger.debug('Transcription ended', {
-          stillSpeaking: speakingRef.current,
-          isStarting: isTranscriptionStartingRef.current,
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          transcriptionLength: transcriptionRef.current?.length || 0
-        })
-        
-        // Clear the starting flag
-        isTranscriptionStartingRef.current = false
-        
-        // Don't auto-restart if we're not speaking anymore (recording stopped)
-        // Also check if MediaRecorder is still recording
-        const mediaRecorder = mediaRecorderRef.current
-        const isStillRecording = speakingRef.current && mediaRecorder && mediaRecorder.state === 'recording'
-        
-        if (!isStillRecording) {
-          console.log('🟡 Not restarting transcription - speech/recording has stopped', {
-            stillSpeaking: speakingRef.current,
-            mediaRecorderState: mediaRecorder?.state
-          })
-          transcriptionRestartCountRef.current = 0
-          // Don't restart wake word recognition here - let it restart naturally when needed
-          // (e.g., when user manually triggers it or when recording completes)
-          return
-        }
-        
-        // Auto-restart if we're still recording, but add delay and limit retries
-        if (isStillRecording && transcriptionRecognitionRef.current && !isTranscriptionStartingRef.current) {
-          // Limit restart attempts to prevent infinite loops
-          if (transcriptionRestartCountRef.current >= 5) {
-            console.warn('⚠️ Too many transcription restarts, stopping auto-restart')
-            logger.warn('Too many transcription restarts, stopping auto-restart', {
-              restartCount: transcriptionRestartCountRef.current
-            })
-            transcriptionRestartCountRef.current = 0
-            // Restart wake word recognition if transcription fails
-            if (wakeModeRef.current && recognitionRef.current && !recognitionRunningRef.current) {
-              try {
-                recognitionRef.current.start()
-              } catch (err) {
-                console.warn('⚠️ Failed to restart wake word recognition', err)
-              }
-            }
-            return
-          }
-          
-          // Clear any existing restart timeout
-          if (transcriptionRestartTimeoutRef.current) {
-            clearTimeout(transcriptionRestartTimeoutRef.current)
-          }
-          
-          // Add exponential backoff delay before restarting
-          const delay = Math.min(1000 * Math.pow(2, transcriptionRestartCountRef.current), 5000)
-          transcriptionRestartCountRef.current++
-          
-          console.log(`🟢 Scheduling transcription restart in ${delay}ms (attempt ${transcriptionRestartCountRef.current})`)
-          transcriptionRestartTimeoutRef.current = window.setTimeout(() => {
-            transcriptionRestartTimeoutRef.current = null
-            // Double-check that we're still recording before restarting
-            const mediaRecorder = mediaRecorderRef.current
-            const transcriptionRecognition = transcriptionRecognitionRef.current
-            const isStillRecording = speakingRef.current && 
-                                    mediaRecorder && 
-                                    mediaRecorder.state === 'recording' &&
-                                    transcriptionRecognition &&
-                                    !isTranscriptionStartingRef.current
-            
-            if (isStillRecording && transcriptionRecognition) {
-              isTranscriptionStartingRef.current = true
-              try {
-                console.log('🟢 Auto-restarting transcription')
-                transcriptionRecognition.start()
-                logger.debug('Transcription restarted', { attempt: transcriptionRestartCountRef.current })
-              } catch (err) {
-                console.error('❌ Failed to restart transcription', err)
-                logger.warn('Failed to restart transcription', err)
-                isTranscriptionStartingRef.current = false
-              }
-            } else {
-              console.log('🟡 Not restarting transcription - recording has stopped', {
-                stillSpeaking: speakingRef.current,
-                mediaRecorderState: mediaRecorder?.state
-              })
-              transcriptionRestartCountRef.current = 0
-            }
-          }, delay)
-        } else {
-          // Reset restart count if we're not restarting
-          transcriptionRestartCountRef.current = 0
-        }
-      }
-
-      try {
-        console.log('🟢 Calling transcriptionRecognition.start()', {
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          speakingRef: speakingRef.current,
-          recognitionRunning: recognitionRunningRef.current,
-          timestamp: new Date().toISOString()
-        })
-        isTranscriptionStartingRef.current = true
-        transcriptionRecognition.start()
-        console.log('✅ transcriptionRecognition.start() called - waiting for onstart event')
-        logger.info('Transcription start() called successfully', {
-          mediaRecorderState: mediaRecorderRef.current?.state
-        })
-        addLog('system', 'Starting speech recognition...')
-      } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err)
-        console.error('❌ Failed to start transcription', {
-          error: errorMsg,
-          err,
-          mediaRecorderState: mediaRecorderRef.current?.state,
-          speakingRef: speakingRef.current
-        })
-        logger.error('Failed to start transcription', { error: errorMsg, err })
-        addLog('system', `Failed to start transcription: ${errorMsg}`)
-        setError(`Failed to start transcription: ${errorMsg}`)
-        isTranscriptionStartingRef.current = false
-      }
-    } catch (err) {
-      logger.error('Failed to start transcription', err)
-      addLog('system', 'Failed to start transcription - check browser console')
-    }
-  }
-
-  const stopTranscription = async () => {
-    // Clear any pending restart
-    if (transcriptionRestartTimeoutRef.current) {
-      clearTimeout(transcriptionRestartTimeoutRef.current)
-      transcriptionRestartTimeoutRef.current = null
-    }
-    transcriptionRestartCountRef.current = 0
-    isTranscriptionStartingRef.current = false
-    
-    if (!transcriptionRecognitionRef.current) {
-      return
-    }
-    
-    try {
-      transcriptionRecognitionRef.current.stop()
-      // Wait a bit for final results to be processed
-      await new Promise(resolve => setTimeout(resolve, 800))
-    } catch {
-      // ignore
-    }
-    transcriptionRecognitionRef.current = null
-    
-    // Don't restart wake word recognition here - let it restart naturally when needed
-    // (e.g., when user manually triggers it or when recording completes)
-  }
-
+  // TTS for chatbot responses
   const playTTS = (text: string) => {
     if (!text.trim() || !('speechSynthesis' in window)) {
-      logger.warn('TTS not available or empty text', { hasTTS: 'speechSynthesis' in window, textLength: text.trim().length })
+      logger.warn('TTS not available or empty text')
       return
     }
 
@@ -1433,29 +1138,17 @@ function App() {
         isTTSPlayingRef.current = true
         setStatusText('Playing response...')
         logger.info('TTS started', { textLength: text.length })
+        addLog('system', 'TTS started', `Playing: ${text.substring(0, 50)}...`)
         
-        // Stop any ongoing recording when TTS starts
-        const mediaRecorder = mediaRecorderRef.current
-        if (mediaRecorder && mediaRecorder.state === 'recording') {
+        // Stop any active recording when TTS starts (prevent feedback loop)
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+          logger.info('Stopping recording because TTS started')
           try {
-            console.log('🟡 Stopping recording because TTS started')
-            logger.info('Stopping recording because TTS started')
-            mediaRecorder.stop()
+            mediaRecorderRef.current.stop()
             speakingRef.current = false
             setState('listening')
           } catch (err) {
-            console.warn('⚠️ Failed to stop recording when TTS started', err)
             logger.warn('Failed to stop recording when TTS started', err)
-          }
-        }
-        
-        // Stop transcription if running
-        if (transcriptionRecognitionRef.current) {
-          try {
-            console.log('🟡 Stopping transcription because TTS started')
-            transcriptionRecognitionRef.current.stop()
-          } catch {
-            // ignore
           }
         }
       }
@@ -1464,10 +1157,17 @@ function App() {
         setIsTTSPlaying(false)
         isTTSPlayingRef.current = false
         ttsUtteranceRef.current = null
+        logger.info('TTS ended')
+        addLog('system', 'TTS ended')
+        
+        // After TTS ends, allow recording to resume
         if (wakeModeRef.current) {
           setStatusText('Waiting for wake word: say "Hey AI" or "start"...')
+          // Reset wake trigger to allow new wake word detection
+          wakeTriggeredRef.current = false
+        } else {
+          setStatusText('Ready to listen...')
         }
-        logger.info('TTS ended')
       }
 
       utterance.onerror = (event) => {
@@ -1479,7 +1179,6 @@ function App() {
 
       ttsUtteranceRef.current = utterance
       window.speechSynthesis.speak(utterance)
-      logger.info('TTS speak called', { textLength: text.length })
     } catch (error) {
       logger.error('Failed to create TTS utterance', error)
       setIsTTSPlaying(false)
@@ -1494,277 +1193,8 @@ function App() {
     setIsTTSPlaying(false)
     isTTSPlayingRef.current = false
     ttsUtteranceRef.current = null
-  }
-
-  const playLastAudio = () => {
-    if (!lastAudioBlobRef.current) {
-      setError('No audio recording available to play')
-      return
-    }
-
-    // Stop any currently playing audio
-    if (audioPlayerRef.current) {
-      audioPlayerRef.current.pause()
-      audioPlayerRef.current = null
-    }
-
-    // Stop TTS if playing
-    stopTTS()
-
-    const audioUrl = URL.createObjectURL(lastAudioBlobRef.current)
-    const audio = new Audio(audioUrl)
-    audioPlayerRef.current = audio
-
-    audio.onplay = () => {
-      setIsAudioPlaying(true)
-      isAudioPlayingRef.current = true
-      setStatusText('Playing audio... (speak to interrupt)')
-    }
-
-    audio.onended = () => {
-      URL.revokeObjectURL(audioUrl)
-      audioPlayerRef.current = null
-      setIsAudioPlaying(false)
-      isAudioPlayingRef.current = false
-      if (wakeModeRef.current) {
-        setStatusText('Waiting for wake word: say "Hey AI" or "start"...')
-      }
-    }
-
-    audio.onerror = () => {
-      setError('Failed to play audio')
-      URL.revokeObjectURL(audioUrl)
-      audioPlayerRef.current = null
-      setIsAudioPlaying(false)
-      isAudioPlayingRef.current = false
-    }
-
-    audio.onpause = () => {
-      setIsAudioPlaying(false)
-      isAudioPlayingRef.current = false
-    }
-
-    audio.play().catch((err) => {
-      logger.error('Failed to play audio', err)
-      setError('Failed to play audio')
-      URL.revokeObjectURL(audioUrl)
-      audioPlayerRef.current = null
-      setIsAudioPlaying(false)
-    })
-  }
-
-  const stopAudio = () => {
-    if (audioPlayerRef.current) {
-      audioPlayerRef.current.pause()
-      audioPlayerRef.current = null
-      setIsAudioPlaying(false)
-      isAudioPlayingRef.current = false
-      setPlayingRecording(null)
-    }
-  }
-
-  const playRecording = async (filename: string) => {
-    try {
-      // Stop any currently playing audio
-      stopAudio()
-      stopTTS()
-
-      setPlayingRecording(filename)
-      setStatusText(`Loading audio: ${filename}...`)
-
-      const blob = await downloadAudioFile(filename)
-      const audioUrl = URL.createObjectURL(blob)
-      const audio = new Audio(audioUrl)
-      audioPlayerRef.current = audio
-
-      audio.onplay = () => {
-        setIsAudioPlaying(true)
-        isAudioPlayingRef.current = true
-        setStatusText(`Playing: ${filename}... (speak to interrupt)`)
-      }
-
-      audio.onended = () => {
-        URL.revokeObjectURL(audioUrl)
-        audioPlayerRef.current = null
-        setIsAudioPlaying(false)
-        isAudioPlayingRef.current = false
-        setPlayingRecording(null)
-        if (wakeModeRef.current) {
-          setStatusText('Waiting for wake word: say "Hey AI" or "start"...')
-        }
-      }
-
-      audio.onerror = () => {
-        setError('Failed to play audio')
-        URL.revokeObjectURL(audioUrl)
-        audioPlayerRef.current = null
-        setIsAudioPlaying(false)
-        isAudioPlayingRef.current = false
-        setPlayingRecording(null)
-      }
-
-      audio.onpause = () => {
-        setIsAudioPlaying(false)
-        isAudioPlayingRef.current = false
-        setPlayingRecording(null)
-      }
-
-      await audio.play()
-    } catch (err) {
-      logger.error('Failed to play recording', err)
-      setError(`Failed to play audio: ${err instanceof Error ? err.message : 'Unknown error'}`)
-      setPlayingRecording(null)
-    }
-  }
-
-  const viewTranscriptionLog = async (sessionId: string) => {
-    try {
-      setLoadingLogContent(true)
-      const content = await getTranscriptionLogContent(sessionId)
-      setViewingLogContent(content)
-    } catch (err) {
-      logger.error('Failed to load transcription log', err)
-      setError(`Failed to load log: ${err instanceof Error ? err.message : 'Unknown error'}`)
-    } finally {
-      setLoadingLogContent(false)
-    }
-  }
-
-  const uploadRecording = async (blob: Blob) => {
-    // Use ref to get the latest sessionId value (important for closures)
-    const currentSessionId = sessionIdRef.current || sessionId
-    console.log('🔵 uploadRecording called', {
-      blobSize: blob.size,
-      saveTextFile: saveTextFileRef.current,
-      sessionId: currentSessionId,
-      sessionIdFromRef: sessionIdRef.current,
-      sessionIdFromState: sessionId,
-      timestamp: new Date().toISOString()
-    })
-    logger.info('uploadRecording called', {
-      blobSize: blob.size,
-      saveTextFile: saveTextFileRef.current,
-      sessionId: currentSessionId,
-      sessionIdFromRef: sessionIdRef.current,
-      sessionIdFromState: sessionId
-    })
-    
-    try {
-      setState('uploading')
-      
-      // IMPORTANT: In text-only mode, MediaRecorder still works to capture audio for transcription
-      // We just don't upload the audio file to the backend - only the transcription text is saved
-      // If text file toggle is on, only send transcription (no audio upload)
-      // Use ref to get the latest value (important for closures)
-      if (saveTextFileRef.current) {
-        console.log('🔵 Text-only mode: MediaRecorder worked for transcription, but skipping audio upload')
-        // Use ref value which has the latest transcription (even if state hasn't updated)
-        // Wait a bit more to ensure transcription is fully captured
-        await new Promise(resolve => setTimeout(resolve, 200))
-        const currentTranscription = transcriptionRef.current || transcription
-        
-        // Debug logging
-        logger.info('Text-only mode: Preparing to send transcription', {
-          sessionId: currentSessionId,
-          sessionIdFromRef: sessionIdRef.current,
-          sessionIdFromState: sessionId,
-          transcriptionLength: currentTranscription.length,
-          transcriptionPreview: currentTranscription.substring(0, 50),
-          hasSessionId: !!currentSessionId,
-          saveTextFileRef: saveTextFileRef.current
-        })
-        console.log('🔵 Text-only mode: Preparing to send transcription', {
-          sessionId: currentSessionId,
-          hasSessionId: !!currentSessionId
-        })
-        
-        // Always send transcription if we have a sessionId, even if transcription is empty
-        // This ensures session logs are created
-        if (currentSessionId) {
-          setStatusText('Sending transcription to backend...')
-          try {
-            // Send transcription even if empty to ensure session log is created
-            const textToSend = currentTranscription.trim() || '(no transcription)'
-            console.log('🟢 Sending transcription to backend', {
-              sessionId: currentSessionId,
-              textLength: textToSend.length,
-              textPreview: textToSend.substring(0, 100),
-              apiUrl: `${config.apiUrl}/transcription`
-            })
-            logger.info('Sending transcription to backend', { 
-              sessionId: currentSessionId, 
-              textLength: textToSend.length,
-              textPreview: textToSend.substring(0, 100)
-            })
-            await sendTranscriptionText(textToSend, currentSessionId)
-            console.log('✅ Transcription sent successfully')
-            logger.info('Transcription text sent to backend successfully', { sessionId: currentSessionId, length: textToSend.length })
-            setStatusText('Transcription saved to session log.')
-            addLog('upload', 'Transcription saved to session log', `Session: ${currentSessionId}`)
-            
-            // Refresh transcription logs list
-            try {
-              const logsData = await getTranscriptionLogs()
-              setTranscriptionLogs(logsData)
-              logger.info('Transcription logs list refreshed', { count: logsData.length })
-            } catch (err) {
-              logger.warn('Failed to refresh transcription logs list', err)
-            }
-          } catch (err: unknown) {
-            const errorMsg = err instanceof Error ? err.message : String(err)
-            logger.error('Failed to send transcription text', { error: errorMsg, sessionId: currentSessionId, err })
-            setStatusText('Failed to save transcription.')
-            setError(`Failed to save transcription: ${errorMsg}`)
-            addLog('upload', 'Failed to save transcription', errorMsg)
-            setState('error')
-            return
-          }
-        } else {
-          logger.error('No sessionId available for transcription', { 
-            sessionId: currentSessionId,
-            sessionIdFromRef: sessionIdRef.current,
-            sessionIdFromState: sessionId
-          })
-          console.error('❌ No sessionId available', {
-            sessionId: currentSessionId,
-            sessionIdFromRef: sessionIdRef.current,
-            sessionIdFromState: sessionId
-          })
-          setStatusText('No session ID available to save transcription.')
-          setError('No session ID available')
-          addLog('upload', 'No session ID available', 'Cannot save transcription without session ID')
-        }
-      } else {
-        // Toggle is off: save audio recording
-        setStatusText('Uploading recording to backend...')
-        const data = await uploadFile(blob, 'recording.webm')
-        setLastFilename(data.filename)
-        setStatusText('Recording uploaded successfully.')
-        
-        // Refresh recordings list
-        try {
-          const recordingsData = await getRecordings()
-          setRecordings(recordingsData)
-        } catch (err) {
-          logger.warn('Failed to refresh recordings list', err)
-        }
-      }
-      
-      if (wakeModeRef.current) {
-        // Stay in wake mode and keep listening for the next trigger
-        setState('listening')
-        setStatusText('Say "Hey AI" or "start" again when ready.')
-      } else {
-        setState('done')
-      }
-    } catch (err: unknown) {
-      logger.error('Upload failed', err)
-      reset()
-      const message = err instanceof Error ? err.message : 'Upload failed'
-      setError(message)
-      setStatusText('Upload failed.')
-      setState('error')
-    }
+    logger.info('TTS stopped')
+    addLog('system', 'TTS stopped')
   }
 
   const vadLabel =
@@ -1828,49 +1258,89 @@ function App() {
 
       {/* Main Content */}
       <main className="flex-1 w-full max-w-7xl mx-auto px-6 pt-8 pb-4">
-        {/* Transcription - Prominent Display Above All Content */}
-        <div className="mb-6 rounded-xl p-6 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.8)', borderColor: 'rgba(217, 119, 6, 0.5)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
-          <div className="flex items-center gap-3 mb-4">
-            <span className="text-2xl">📝</span>
+        {/* Chatbot Interface */}
+        <div className="mb-6 rounded-xl border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.8)', borderColor: 'rgba(217, 119, 6, 0.5)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
+          <div className="p-6 border-b-2" style={{ borderColor: 'rgba(217, 119, 6, 0.3)' }}>
+            <div className="flex items-center gap-3">
+              <span className="text-2xl">🤖</span>
             <div>
-              <h2 className="text-lg font-bold text-gold-300">Live Transcription</h2>
-              <p className="text-xs text-gray-400">Real-time speech-to-text conversion</p>
+                <h2 className="text-lg font-bold text-gold-300">AI Chatbot</h2>
+                <p className="text-xs text-gray-400">Voice-activated conversation assistant</p>
+            </div>
+              {isTTSPlaying && (
+                <div className="ml-auto flex items-center gap-2 text-sm text-gold-400">
+                  <span className="animate-pulse">🔊</span>
+                  <span>Playing response...</span>
+          </div>
+              )}
             </div>
           </div>
-          <div className="p-5 rounded-lg border-2" style={{ backgroundColor: 'rgba(17, 24, 39, 0.7)', borderColor: 'rgba(217, 119, 6, 0.3)', minHeight: '100px', maxHeight: '300px', overflowY: 'auto' }}>
-            {completeTranscription || transcription ? (
-              <div>
-                {completeTranscription && (
-                  <p className="text-gray-300 leading-relaxed text-sm font-normal whitespace-pre-wrap mb-3">{completeTranscription}</p>
-                )}
-                {transcription && (
-                  <p className={`text-gold-200 leading-relaxed text-base font-medium whitespace-pre-wrap ${completeTranscription ? 'border-t-2 pt-3' : ''}`} style={{ borderColor: 'rgba(217, 119, 6, 0.3)' }}>
-                    {transcription}
-                  </p>
-                )}
+          
+          {/* Chat Messages */}
+          <div 
+            ref={chatContainerRef}
+            className="p-6 max-h-96 overflow-y-auto flex flex-col" 
+            style={{ minHeight: '200px' }}
+          >
+            {chatMessages.length === 0 && !isProcessing ? (
+              <div className="text-center py-12 text-gray-400 flex-1 flex items-center justify-center">
+                <div>
+                  <p className="text-lg mb-2">👋 Welcome!</p>
+                  <p className="text-sm">Say "Hey AI" or "start" to begin a conversation</p>
+                </div>
               </div>
             ) : (
-              <p className="text-gray-500 italic text-sm">Waiting for speech... Transcription will appear here when you start speaking.</p>
+              <div className="space-y-4 flex flex-col">
+                {chatMessages.map((msg) => (
+                  <div
+                    key={msg.id}
+                    className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div
+                      className={`max-w-[80%] rounded-lg p-4 border-2 ${
+                        msg.type === 'user'
+                          ? 'bg-gold-900/30 border-gold-600/50 text-gold-200'
+                          : msg.error
+                          ? 'bg-red-900/30 border-red-600/50 text-red-200'
+                          : 'bg-dark-800 border-gold-500/50 text-gold-100'
+                      }`}
+                    >
+                      <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+                      {msg.type === 'assistant' && msg.backend && (
+                        <p className="text-xs mt-2 opacity-70">
+                          Powered by: {msg.backend}
+                        </p>
+                      )}
+                      <p className="text-xs mt-2 opacity-50">
+                        {msg.timestamp.toLocaleTimeString()}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+                {/* ChatGPT-style thinking indicator */}
+                {isProcessing && (
+                  <div className="flex justify-start">
+                    <div className="max-w-[80%] rounded-lg p-4 border-2 bg-dark-800 border-gold-500/50">
+                      <div className="flex items-center gap-2 text-gold-300">
+                        <div className="flex gap-1">
+                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                          <span className="w-2 h-2 bg-gold-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                        </div>
+                        <span className="text-sm">Thinking...</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {/* Invisible element at bottom for scroll target */}
+                <div ref={chatMessagesEndRef} />
+              </div>
             )}
           </div>
-          {(isTTSPlaying || isAudioPlaying) && (
-            <div className="mt-3 flex items-center gap-2 text-sm text-gold-400">
-              <span className="animate-pulse">🔊</span>
-              <span>
-                {isTTSPlaying && 'Playing response... (speak to interrupt)'}
-                {isAudioPlaying && 'Playing audio... (speak to interrupt)'}
-              </span>
-            </div>
-          )}
         </div>
 
         {/* Stats Bar */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-          <div className="rounded-lg p-4 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.6)', borderColor: 'rgba(217, 119, 6, 0.3)' }}>
-            <div className="text-xs uppercase tracking-wider text-gray-400 mb-1">Recordings</div>
-            <div className="text-2xl font-bold text-gold-400">{recordings.length}</div>
-            <div className="text-xs text-gray-500 mt-1">Audio files</div>
-          </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
           <div className="rounded-lg p-4 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.6)', borderColor: 'rgba(217, 119, 6, 0.3)' }}>
             <div className="text-xs uppercase tracking-wider text-gray-400 mb-1">Status</div>
             <div className="text-2xl font-bold text-gold-400 capitalize">{state}</div>
@@ -1923,12 +1393,6 @@ function App() {
                 <div className={`w-3 h-3 rounded-full ${state === 'recording' ? 'bg-red-500 animate-pulse' : state === 'listening' ? 'bg-green-500' : 'bg-gray-500'}`}></div>
               </div>
               <p className="text-gold-200 font-medium text-sm leading-relaxed">{statusText}</p>
-              {state === 'uploading' && (
-                <div className="mt-4 flex items-center gap-2 p-3 rounded-lg" style={{ backgroundColor: 'rgba(17, 24, 39, 0.5)' }}>
-                  <div className="animate-spin rounded-full h-5 w-5 border-2 border-gold-500 border-t-transparent"></div>
-                  <span className="text-xs text-gray-300 font-medium">Uploading to server...</span>
-                </div>
-              )}
             </div>
 
             {/* Error Display */}
@@ -1944,81 +1408,41 @@ function App() {
           </div>
             )}
 
-            {/* Save Text File Toggle */}
-            <div className="rounded-xl p-6 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.7)', borderColor: saveTextFile ? 'rgba(217, 119, 6, 0.6)' : 'rgba(217, 119, 6, 0.4)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
-              <div className="flex items-center justify-between">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2 mb-1">
-                    <h3 className="text-sm font-semibold text-gold-300 uppercase tracking-wider">Text-Only Mode</h3>
-                    {saveTextFile && (
-                      <span className="px-2 py-0.5 text-xs font-semibold rounded" style={{ backgroundColor: 'rgba(217, 119, 6, 0.2)', color: '#fbbf24' }}>
-                        ON
+            {/* VAD Sensitivity Tuning */}
+            <div className="rounded-xl p-6 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.7)', borderColor: 'rgba(217, 119, 6, 0.4)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-sm font-semibold text-gold-300 uppercase tracking-wider">VAD Sensitivity</h3>
+                  <span className="text-xs text-gold-400 font-semibold">
+                    {Math.round(vadSensitivity * 100)}%
                       </span>
-                    )}
-                    {!saveTextFile && (
-                      <span className="px-2 py-0.5 text-xs font-semibold rounded bg-gray-700 text-gray-400">
-                        OFF
-                      </span>
-                    )}
                   </div>
-                  <p className="text-xs text-gray-400">
-                    {saveTextFile 
-                      ? 'Only transcription will be saved (no audio recording)'
-                      : 'Audio recordings will be saved normally'}
-                  </p>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer ml-4" style={{ minWidth: '3.5rem' }}>
+                <p className="text-xs text-gray-400 mb-3">
+                  Adjust sensitivity: Lower = more sensitive (detects quieter speech), Higher = less sensitive (only loud speech)
+                </p>
                   <input
-                    type="checkbox"
-                    checked={saveTextFile}
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={vadSensitivity}
                     onChange={(e) => {
-                      const newValue = e.target.checked
-                      setSaveTextFile(newValue)
-                      saveTextFileRef.current = newValue
-                    }}
-                    className="sr-only"
-                  />
-                  <div 
-                    className="w-14 h-7 rounded-full transition-all duration-200 relative"
+                    const newValue = parseFloat(e.target.value)
+                    setVadSensitivity(newValue)
+                    vadSensitivityRef.current = newValue
+                  }}
+                  className="w-full h-2 bg-dark-900 rounded-lg appearance-none cursor-pointer"
                     style={{
-                      backgroundColor: saveTextFile ? '#d97706' : '#374151',
-                      boxShadow: saveTextFile ? '0 0 0 2px rgba(217, 119, 6, 0.3)' : 'inset 0 2px 4px rgba(0, 0, 0, 0.2)'
-                    }}
-                  >
-                    <div
-                      className="absolute top-0.5 left-0.5 w-6 h-6 bg-white rounded-full transition-all duration-200 shadow-md"
-                      style={{
-                        transform: saveTextFile ? 'translateX(1.75rem)' : 'translateX(0)',
-                      }}
-                    ></div>
+                    background: `linear-gradient(to right, #d97706 0%, #d97706 ${vadSensitivity * 100}%, #374151 ${vadSensitivity * 100}%, #374151 100%)`
+                  }}
+                />
+                <div className="flex justify-between text-xs text-gray-500 mt-1">
+                  <span>More Sensitive</span>
+                  <span>Less Sensitive</span>
                   </div>
-                </label>
               </div>
             </div>
 
-            {/* Last Filename and Play Button */}
-        {lastFilename && (
-              <div className="rounded-xl p-4 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.7)', borderColor: 'rgba(217, 119, 6, 0.4)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center gap-2">
-                    <span className="text-gold-400">💾</span>
-                    <p className="text-xs text-gray-400 font-medium">Last Saved Recording</p>
-                  </div>
-                  {lastAudioBlob && (
-                    <button
-                      onClick={playLastAudio}
-                      className="px-3 py-1.5 rounded-lg text-xs bg-gold-600 hover:bg-gold-500 text-white font-semibold transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-gold-500 focus:ring-offset-2 focus:ring-offset-dark-900 flex items-center gap-1.5"
-                      title="Play last audio recording"
-                      type="button"
-                    >
-                      <span>▶</span>
-                      <span>Play Audio</span>
-                    </button>
-                  )}
-                </div>
-                <code className="text-gold-300 text-sm font-mono break-all bg-dark-900 px-3 py-2 rounded block">{lastFilename}</code>
-          </div>
-        )}
 
             {/* Quick Info Card */}
             <div className="rounded-xl p-6 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.7)', borderColor: 'rgba(217, 119, 6, 0.4)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
@@ -2034,12 +1458,6 @@ function App() {
                   <span className="text-gray-400">Wake Word:</span>
                   <span className={`font-medium ${wakeEverTriggered ? 'text-green-400' : 'text-gray-500'}`}>
                     {wakeEverTriggered ? '✓ Detected' : 'Waiting'}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-gray-400">Transcription:</span>
-                  <span className={`font-medium ${transcription ? 'text-green-400' : 'text-gray-500'}`}>
-                    {transcription ? '✓ Active' : 'Inactive'}
                   </span>
                 </div>
               </div>
@@ -2124,13 +1542,11 @@ function App() {
                             system: 'text-blue-300',
                             wake: 'text-gold-300',
                             vad: 'text-green-300',
-                            upload: 'text-cyan-300',
                           }[log.source]
                           const logIcon = {
                             system: '🔧',
                             wake: '👂',
                             vad: '🎤',
-                            upload: '📤',
                           }[log.source]
                           return (
                             <li key={log.id} className="text-xs border-b-2 pb-3 last:border-0 last:pb-0" style={{ borderColor: 'rgba(55, 65, 81, 0.6)' }}>
@@ -2151,176 +1567,7 @@ function App() {
                     </div>
                   </div>
                 )}
-
-                {/* Audio Recordings List */}
-                <div className="rounded-xl p-6 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.7)', borderColor: 'rgba(217, 119, 6, 0.4)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
-                  <div className="flex items-center justify-between mb-4">
-                    <div>
-                      <h2 className="text-xl font-bold text-gold-300 mb-1">Audio Recordings</h2>
-                      <p className="text-xs text-gray-400">List of all recorded audio files</p>
           </div>
-                    <span className="px-3 py-2 rounded-lg bg-dark-800 border-2 text-gold-300 text-sm font-semibold" style={{ borderColor: 'rgba(217, 119, 6, 0.4)' }}>
-                      {recordings.length} files
-                    </span>
-                  </div>
-                  <div className="rounded-lg border-2 p-4 max-h-96 overflow-y-auto" style={{ backgroundColor: 'rgba(17, 24, 39, 0.5)', borderColor: 'rgba(217, 119, 6, 0.3)' }}>
-                    {loadingRecordings ? (
-                      <div className="flex items-center justify-center py-8">
-                        <div className="animate-spin rounded-full h-8 w-8 border-2 border-gold-500 border-t-transparent"></div>
-                        <span className="ml-3 text-gray-400">Loading recordings...</span>
-                      </div>
-                    ) : recordings.length === 0 ? (
-                      <p className="text-gray-500 italic text-sm text-center py-8">No audio recordings found</p>
-                    ) : (
-                      <ul className="space-y-3">
-                        {recordings.map((recording, index) => {
-                          const sizeMB = (recording.size / (1024 * 1024)).toFixed(2)
-                          const modifiedDate = new Date(recording.modified).toLocaleString()
-                          const isPlaying = playingRecording === recording.filename
-                          return (
-                            <li key={index} className="text-xs border-b-2 pb-3 last:border-0 last:pb-0" style={{ borderColor: 'rgba(55, 65, 81, 0.6)' }}>
-                              <div className="flex items-start gap-3">
-                                <span className="text-cyan-400 text-base">🎵</span>
-                                <div className="flex-1 min-w-0">
-                                  <div className="flex items-center gap-2 mb-1">
-                                    <code className="text-cyan-300 font-mono text-xs break-all">{recording.filename}</code>
-                                  </div>
-                                  <div className="flex items-center gap-4 text-gray-400 text-[11px] mb-2">
-                                    <span>{sizeMB} MB</span>
-                                    <span>•</span>
-                                    <span>{modifiedDate}</span>
-                                  </div>
-                                  <button
-                                    onClick={() => playRecording(recording.filename)}
-                                    disabled={isPlaying}
-                                    className="px-2 py-1 rounded text-[10px] bg-cyan-600 hover:bg-cyan-500 text-white font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-                                    title="Play audio recording"
-                                    type="button"
-                                  >
-                                    {isPlaying ? (
-                                      <>
-                                        <span className="animate-pulse">⏸</span>
-                                        <span>Playing...</span>
-                                      </>
-                                    ) : (
-                                      <>
-                                        <span>▶</span>
-                                        <span>Play</span>
-                                      </>
-                                    )}
-                                  </button>
-                                </div>
-                              </div>
-                            </li>
-                          )
-                        })}
-                      </ul>
-                    )}
-                  </div>
-                </div>
-
-                {/* Transcription Logs List */}
-                <div className="rounded-xl p-6 border-2" style={{ backgroundColor: 'rgba(31, 41, 55, 0.7)', borderColor: 'rgba(217, 119, 6, 0.4)', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.3)' }}>
-                  <div className="flex items-center justify-between mb-4">
-                    <div>
-                      <h2 className="text-xl font-bold text-gold-300 mb-1">Transcription Logs</h2>
-                      <p className="text-xs text-gray-400">Session-based transcription text files</p>
-                    </div>
-                    <span className="px-3 py-2 rounded-lg bg-dark-800 border-2 text-gold-300 text-sm font-semibold" style={{ borderColor: 'rgba(217, 119, 6, 0.4)' }}>
-                      {transcriptionLogs.length} sessions
-                    </span>
-                  </div>
-                  <div className="rounded-lg border-2 p-4 max-h-96 overflow-y-auto" style={{ backgroundColor: 'rgba(17, 24, 39, 0.5)', borderColor: 'rgba(217, 119, 6, 0.3)' }}>
-                    {loadingLogs ? (
-                      <div className="flex items-center justify-center py-8">
-                        <div className="animate-spin rounded-full h-8 w-8 border-2 border-gold-500 border-t-transparent"></div>
-                        <span className="ml-3 text-gray-400">Loading logs...</span>
-                      </div>
-                    ) : transcriptionLogs.length === 0 ? (
-                      <p className="text-gray-500 italic text-sm text-center py-8">No transcription logs found</p>
-                    ) : (
-                      <ul className="space-y-3">
-                        {transcriptionLogs.map((log, index) => {
-                          const sizeKB = (log.size / 1024).toFixed(2)
-                          const modifiedDate = new Date(log.modified).toLocaleString()
-                          const isViewing = viewingLogContent?.session_id === log.session_id
-                          return (
-                            <li key={index} className="text-xs border-b-2 pb-3 last:border-0 last:pb-0" style={{ borderColor: 'rgba(55, 65, 81, 0.6)' }}>
-                              <div className="flex items-start gap-3">
-                                <span className="text-green-400 text-base">📝</span>
-                                <div className="flex-1 min-w-0">
-                                  <div className="flex items-center gap-2 mb-1">
-                                    <code className="text-green-300 font-mono text-xs break-all">{log.session_id}</code>
-                                    <span className="px-2 py-0.5 rounded bg-dark-800 text-gray-400 text-[10px]">
-                                      {log.entry_count} entries
-                                    </span>
-                                  </div>
-                                  <div className="text-gray-400 text-[11px] mb-2 truncate">{log.first_entry}</div>
-                                  <div className="flex items-center gap-4 text-gray-500 text-[11px] mb-2">
-                                    <span>{sizeKB} KB</span>
-                                    <span>•</span>
-                                    <span>{modifiedDate}</span>
-                                  </div>
-                                  <button
-                                    onClick={() => viewTranscriptionLog(log.session_id)}
-                                    disabled={loadingLogContent}
-                                    className="px-2 py-1 rounded text-[10px] bg-green-600 hover:bg-green-500 text-white font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
-                                    title="View transcription log content"
-                                    type="button"
-                                  >
-                                    {loadingLogContent && isViewing ? (
-                                      <>
-                                        <span className="animate-spin">⟳</span>
-                                        <span>Loading...</span>
-                                      </>
-                                    ) : (
-                                      <>
-                                        <span>📄</span>
-                                        <span>View</span>
-                                      </>
-                                    )}
-                                  </button>
-                                </div>
-                              </div>
-                            </li>
-                          )
-                        })}
-                      </ul>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Transcription Log Viewer Modal */}
-            {viewingLogContent && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(0, 0, 0, 0.8)' }}>
-                <div className="rounded-xl p-6 border-2 max-w-4xl w-full max-h-[90vh] flex flex-col" style={{ backgroundColor: 'rgba(31, 41, 55, 0.95)', borderColor: 'rgba(217, 119, 6, 0.6)', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)' }}>
-                  <div className="flex items-center justify-between mb-4">
-                    <div>
-                      <h2 className="text-xl font-bold text-gold-300 mb-1">Transcription Log</h2>
-                      <p className="text-xs text-gray-400">{viewingLogContent.session_id}</p>
-                    </div>
-                    <button
-                      onClick={() => setViewingLogContent(null)}
-                      className="px-4 py-2 rounded-lg text-sm bg-dark-800 border-2 text-gold-300 hover:bg-dark-700 transition-all"
-                      style={{ borderColor: 'rgba(217, 119, 6, 0.5)' }}
-                      type="button"
-                    >
-                      ✕ Close
-                    </button>
-                  </div>
-                  <div className="rounded-lg border-2 p-4 flex-1 overflow-y-auto" style={{ backgroundColor: 'rgba(17, 24, 39, 0.7)', borderColor: 'rgba(217, 119, 6, 0.3)', minHeight: '300px' }}>
-                    <pre className="text-sm text-gray-200 whitespace-pre-wrap font-mono leading-relaxed">
-                      {viewingLogContent.content}
-                    </pre>
-                  </div>
-                  <div className="mt-4 flex items-center justify-between text-xs text-gray-400">
-                    <span>Size: {(viewingLogContent.size / 1024).toFixed(2)} KB</span>
-                    <span>Modified: {new Date(viewingLogContent.modified).toLocaleString()}</span>
-                  </div>
-                </div>
-              </div>
             )}
 
             {/* Segments */}
