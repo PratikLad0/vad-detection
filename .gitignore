@@ -1,43 +1,51 @@
-# Node / frontend
+# Dependencies
 node_modules/
 frontend/node_modules/
-frontend/dist/
-frontend/.vite/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# Editor / OS
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-.vscode/
-.idea/
-
-# Env / secrets
-.env
-.env.local
-frontend/.env
-backend/.env
-
-# Python / backend
-__pycache__/
-*.py[cod]
+backend/.venv/
+backend/venv/
+backend/__pycache__/
+*.pyc
 *.pyo
 *.pyd
-.pytest_cache/
-.mypy_cache/
-.venv/
-venv/
 
-# Recordings / generated audio
-backend/recordings/
-
-# Build artifacts
+# Build outputs
 dist/
 build/
+frontend/dist/
+*.egg-info/
 
+# Environment variables
+.env
+.env.local
+.env.production
+.env.development
+frontend/.env
+frontend/.env.local
+backend/.env
 
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Recordings (audio and text files)
+backend/recordings/
+**/recordings/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Temporary files
+*.tmp
+*.temp
